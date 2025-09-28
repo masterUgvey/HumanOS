@@ -1,0 +1,13 @@
+# Виртуальное окружение
+venv/
+.env
+
+# Кэш Python
+__pycache__/
+*.pyc
+
+# Настройки IDE
+.vscode/
+.idea/
+*.swp
+*.swo
