@@ -1,158 +1,107 @@
-import os
-import logging
-import asyncio
-from datetime import datetime
-from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
-from reminder import ReminderSystem
-from database import Database
+# -*- coding: utf-8 -*-
+"""
+Применение обновления бота
+Запуск: python apply_update.py
+"""
 
-# Загружаем переменные из .env файла
-load_dotenv()
+print("Применение обновления...")
 
-# Инициализируем базу данных
-db = Database()
+# Читаем функцию main из старого бота
+with open('bot_before_update.py', 'r', encoding='utf-8') as f:
+    old = f.read()
 
-# Включаем логирование, чтобы видеть ошибки
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-
-# Читаем токен из переменной окружения
-TOKEN = os.getenv('BOT_TOKEN')
-if not TOKEN:
-    raise ValueError("Токен не найден! Проверь файл .env")
-
-QUEST_TYPES = {
-    "physical": "💪 Физическая задача",
-    "intellectual": "📚 Интеллектуальная задача",
-    "mental": "🧠 Ментальная задача",
-    "custom": "🎯 Произвольная задача"
-}
-
-
-def get_main_menu_keyboard():
-    keyboard = [
-        [InlineKeyboardButton("📋 Квесты", callback_data="quests_menu")],
-        [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
-        [InlineKeyboardButton("❓ Помощь", callback_data="help")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-
-def get_quests_menu_keyboard():
-    keyboard = [
-        [InlineKeyboardButton("➕ Добавить квест", callback_data="create_quest")],
-        [InlineKeyboardButton("📝 Мои квесты", callback_data="my_quests")],
-        [InlineKeyboardButton("🔙 Назад", callback_data="main_menu")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-
-def get_quest_type_keyboard():
-    keyboard = [
-        [InlineKeyboardButton("💪 Физическая задача", callback_data="type_physical")],
-        [InlineKeyboardButton("📚 Интеллектуальная задача", callback_data="type_intellectual")],
-        [InlineKeyboardButton("🧠 Ментальная задача", callback_data="type_mental")],
-        [InlineKeyboardButton("🎯 Произвольная задача", callback_data="type_custom")],
-        [InlineKeyboardButton("❌ Отменить", callback_data="quests_menu")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-
-def get_cancel_keyboard(callback="cancel_creation"):
-    keyboard = [[InlineKeyboardButton("❌ Отменить", callback_data=callback)]]
-    return InlineKeyboardMarkup(keyboard)
-
-
-def format_quest_text(quest):
-    quest_id, user_id, title, quest_type, target_value, current_value, completed, deadline, comment, created_at = quest
-    
-    type_emoji = {"physical": "💪", "intellectual": "📚", "mental": "🧠", "custom": "🎯"}.get(quest_type, "🎯")
-    
-    if quest_type in ["physical", "intellectual"]:
-        progress_text = f"{current_value}/{target_value}"
+# Находим функцию button_callback
+button_start = old.find('async def button_callback')
+if button_start > 0:
+    button_code = old[button_start:]
+    # Обрезаем до функции main
+    main_start = button_code.find('def main():')
+    if main_start > 0:
+        button_code = button_code[:main_start]
+        main_code = old[old.find('def main()'):]
     else:
-        progress_text = f"{current_value}%"
+        button_code = ""
+        main_code = old[old.find('def main()'):]
+else:
+    button_code = ""
+    main_code = old[old.find('def main()'):]
+
+# Создаем новый button_callback
+new_button_callback = '''
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
     
-    status = "✅ Завершен" if completed else "⏳ В процессе"
+    data = query.data
     
-    text = f"{type_emoji} **{title}**\\n\\n"
-    text += f"Тип: {QUEST_TYPES.get(quest_type, quest_type)}\\n"
-    text += f"Прогресс: {progress_text}\\n"
-    text += f"Статус: {status}\\n"
+    # Главное меню
+    if data == "main_menu":
+        await handle_main_menu(query, context)
+    elif data == "quests_menu":
+        await handle_quests_menu(query, context)
+    elif data == "create_quest":
+        await handle_create_quest(query, context)
+    elif data == "my_quests":
+        await handle_my_quests(query, context)
+    elif data == "stats":
+        await handle_stats(query, context)
+    elif data == "help":
+        await handle_help(query, context)
+    elif data == "cancel_creation":
+        await handle_cancel_creation(query, context)
     
-    if deadline:
-        try:
-            try:
-                d = datetime.strptime(deadline, "%Y-%m-%d %H:%M:%S")
-            except ValueError:
-                d = datetime.strptime(deadline, "%Y-%m-%d")
-            
-            if d.hour != 0 or d.minute != 0:
-                text += f"📅 Дедлайн: {d.strftime('%d.%m.%y %H:%M')}\\n"
-            else:
-                text += f"📅 Дедлайн: {d.strftime('%d.%m.%y')}\\n"
-        except:
-            pass
+    # Типы квестов
+    elif data.startswith("type_"):
+        await handle_quest_type_selection(query, context)
     
-    if comment:
-        text += f"\\n💬 Комментарий: {comment}\\n"
+    # Детали квеста
+    elif data.startswith("quest_") and not data.startswith("quest_type"):
+        await handle_quest_detail(query, context)
     
-    return text
-
-
-def get_quest_detail_keyboard(quest_id, completed):
-    keyboard = []
-    if not completed:
-        keyboard.append([InlineKeyboardButton("📈 Обновить прогресс", callback_data=f"progress_{quest_id}")])
-        keyboard.append([InlineKeyboardButton("✅ Завершить", callback_data=f"complete_{quest_id}")])
-    keyboard.append([InlineKeyboardButton("✏️ Редактировать", callback_data=f"edit_{quest_id}")])
-    keyboard.append([InlineKeyboardButton("🗑️ Удалить", callback_data=f"delete_{quest_id}")])
-    keyboard.append([InlineKeyboardButton("🔙 К списку квестов", callback_data="my_quests")])
-    return InlineKeyboardMarkup(keyboard)
-
-
-def get_edit_quest_keyboard(quest_id):
-    keyboard = [
-        [InlineKeyboardButton("📝 Название", callback_data=f"edit_title_{quest_id}")],
-        [InlineKeyboardButton("🎯 Целевое значение", callback_data=f"edit_target_{quest_id}")],
-        [InlineKeyboardButton("📅 Дедлайн", callback_data=f"edit_deadline_{quest_id}")],
-        [InlineKeyboardButton("💬 Комментарий", callback_data=f"edit_comment_{quest_id}")],
-        [InlineKeyboardButton("🔙 Назад", callback_data=f"quest_{quest_id}")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-
-# Функция-обработчик команды /start
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    db.add_user(user.id, user.first_name)
-    context.user_data.clear()
+    # Обновление прогресса
+    elif data.startswith("progress_"):
+        await handle_progress_update(query, context)
     
-    welcome_text = f"""
-Привет, {user.first_name}! 🚀
-
-Я — твой проводник на пути к Сверхчеловеку. 
-Вместе мы превратим рутину в увлекательную игру!
-
-Выбери действие:
-    """
+    # Завершение квеста
+    elif data.startswith("complete_"):
+        await handle_complete_quest(query, context)
     
-    await update.message.reply_text(welcome_text, reply_markup=get_main_menu_keyboard())
+    # Редактирование
+    elif data.startswith("edit_") and not data.startswith("edit_title") and not data.startswith("edit_target") and not data.startswith("edit_deadline") and not data.startswith("edit_comment"):
+        await handle_edit_quest(query, context)
+    elif data.startswith("edit_title_") or data.startswith("edit_target_") or data.startswith("edit_deadline_") or data.startswith("edit_comment_"):
+        await handle_edit_field(query, context)
+    
+    # Удаление
+    elif data.startswith("delete_"):
+        await handle_delete_quest(query, context)
+    elif data.startswith("confirm_delete_"):
+        await handle_confirm_delete(query, context)
+    
+    else:
+        await query.edit_message_text("Неизвестная команда")
 
-# Функция-обработчик команды /help
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = """
-    Доступные команды:
-    /start - Начать работу
-    /help - Получить справку
-    """
-    await update.message.reply_text(help_text)
 
+'''
 
+# Читаем новые обработчики из текущего bot.py
+with open('bot.py', 'r', encoding='utf-8') as f:
+    current = f.read()
+
+# Находим где заканчиваются вспомогательные функции
+handlers_start = current.find('# Функция-обработчик команды /start')
+
+# Берем все до handle_all_messages
+handlers_end = current.find('async def handle_all_messages')
+
+if handlers_start > 0 and handlers_end > 0:
+    new_handlers = current[handlers_start:handlers_end]
+else:
+    print("Ошибка: не найдены обработчики")
+    exit(1)
+
+# Создаем новую функцию handle_text_message
+new_text_handler = '''
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка текстовых сообщений"""
     text = update.message.text.strip()
@@ -168,7 +117,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         if state == "awaiting_title":
             is_valid, error_msg = db.validate_input(text, "Название")
             if not is_valid:
-                await update.message.reply_text(f"❌ {error_msg}\n\nПопробуй ещё раз")
+                await update.message.reply_text(f"❌ {error_msg}\\n\\nПопробуй ещё раз")
                 return
             
             context.user_data["quest_title"] = text
@@ -178,11 +127,11 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 context.user_data["target_value"] = 100
                 context.user_data["state"] = "awaiting_deadline"
                 
-                text_msg = f"Название: {text}\n\nУстановить дедлайн?\n**Форматы:**\n• ДД.ММ.ГГ ЧЧ:ММ\n• ДД.ММ.ГГ\n• 'нет' - пропустить"
+                text_msg = f"Название: {text}\\n\\nУстановить дедлайн?\\n**Форматы:**\\n• ДД.ММ.ГГ ЧЧ:ММ\\n• ДД.ММ.ГГ\\n• 'нет' - пропустить"
                 await update.message.reply_text(text_msg, parse_mode='Markdown')
             else:
                 context.user_data["state"] = "awaiting_target"
-                text_msg = f"Название: {text}\n\nВведи целевое значение:\n**Примеры:** 50, 100"
+                text_msg = f"Название: {text}\\n\\nВведи целевое значение:\\n**Примеры:** 50, 100"
                 await update.message.reply_text(text_msg, parse_mode='Markdown')
         
         # Создание квеста - ввод целевого значения
@@ -199,7 +148,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             context.user_data["target_value"] = target_value
             context.user_data["state"] = "awaiting_deadline"
             
-            text_msg = f"Целевое значение: {target_value}\n\nУстановить дедлайн?\n**Форматы:**\n• ДД.ММ.ГГ ЧЧ:ММ\n• ДД.ММ.ГГ\n• 'нет' - пропустить"
+            text_msg = f"Целевое значение: {target_value}\\n\\nУстановить дедлайн?\\n**Форматы:**\\n• ДД.ММ.ГГ ЧЧ:ММ\\n• ДД.ММ.ГГ\\n• 'нет' - пропустить"
             await update.message.reply_text(text_msg, parse_mode='Markdown')
         
         # Создание квеста - ввод дедлайна
@@ -221,13 +170,13 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                     
                     deadline = deadline_date.strftime("%Y-%m-%d %H:%M:%S")
                 except ValueError:
-                    await update.message.reply_text("❌ Неверный формат даты!\n\n**Используй:** ДД.ММ.ГГ или ДД.ММ.ГГ ЧЧ:ММ", parse_mode='Markdown')
+                    await update.message.reply_text("❌ Неверный формат даты!\\n\\n**Используй:** ДД.ММ.ГГ или ДД.ММ.ГГ ЧЧ:ММ", parse_mode='Markdown')
                     return
             
             context.user_data["deadline"] = deadline
             context.user_data["state"] = "awaiting_comment"
             
-            text_msg = "Добавить комментарий?\n\n**Пример:** Важно выполнить утром\n\nИли напиши 'нет'"
+            text_msg = "Добавить комментарий?\\n\\n**Пример:** Важно выполнить утром\\n\\nИли напиши 'нет'"
             await update.message.reply_text(text_msg, parse_mode='Markdown')
         
         # Создание квеста - ввод комментария
@@ -262,7 +211,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             
             context.user_data.clear()
             
-            success_text = f"🎉 Квест **{quest_title}** создан!\n\nНайди его в 'Мои квесты'"
+            success_text = f"🎉 Квест **{quest_title}** создан!\\n\\nНайди его в 'Мои квесты'"
             await update.message.reply_text(success_text, reply_markup=get_quests_menu_keyboard(), parse_mode='Markdown')
         
         # Обновление прогресса
@@ -384,13 +333,13 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def handle_main_menu(query, context):
     context.user_data.clear()
-    text = "Главное меню\n\nВыбери действие:"
+    text = "Главное меню\\n\\nВыбери действие:"
     await query.edit_message_text(text, reply_markup=get_main_menu_keyboard())
 
 
 async def handle_quests_menu(query, context):
     context.user_data.clear()
-    text = "📋 **Квесты**\n\nВыбери действие:"
+    text = "📋 **Квесты**\\n\\nВыбери действие:"
     await query.edit_message_text(text, reply_markup=get_quests_menu_keyboard(), parse_mode='Markdown')
 
 
@@ -398,10 +347,10 @@ async def handle_create_quest(query, context):
     context.user_data.clear()
     context.user_data["creating_quest"] = True
     
-    text = "Выбери тип квеста:\n\n"
-    text += "💪 **Физическая задача** - с количественным значением\n"
-    text += "📚 **Интеллектуальная задача** - с количественным значением\n"
-    text += "🧠 **Ментальная задача** - с процентом выполнения (0-100%)\n"
+    text = "Выбери тип квеста:\\n\\n"
+    text += "💪 **Физическая задача** - с количественным значением\\n"
+    text += "📚 **Интеллектуальная задача** - с количественным значением\\n"
+    text += "🧠 **Ментальная задача** - с процентом выполнения (0-100%)\\n"
     text += "🎯 **Произвольная задача** - с процентом выполнения (0-100%)"
     
     await query.edit_message_text(text, reply_markup=get_quest_type_keyboard(), parse_mode='Markdown')
@@ -414,9 +363,9 @@ async def handle_quest_type_selection(query, context):
     
     type_name = QUEST_TYPES.get(quest_type, "Квест")
     
-    text = f"Тип квеста: {type_name}\n\n"
-    text += "Введи название квеста:\n\n"
-    text += "**Примеры:**\n• Утренняя пробежка\n• Прочитать книгу"
+    text = f"Тип квеста: {type_name}\\n\\n"
+    text += "Введи название квеста:\\n\\n"
+    text += "**Примеры:**\\n• Утренняя пробежка\\n• Прочитать книгу"
     
     await query.edit_message_text(text, reply_markup=get_cancel_keyboard(), parse_mode='Markdown')
 
@@ -426,7 +375,7 @@ async def handle_my_quests(query, context):
     quests = db.get_user_quests(user_id)
     
     if not quests:
-        text = "📋 У тебя пока нет активных квестов!\n\nСоздай свой первый квест! 💪"
+        text = "📋 У тебя пока нет активных квестов!\\n\\nСоздай свой первый квест! 💪"
         keyboard = [
             [InlineKeyboardButton("➕ Создать квест", callback_data="create_quest")],
             [InlineKeyboardButton("🔙 Назад", callback_data="quests_menu")]
@@ -434,7 +383,7 @@ async def handle_my_quests(query, context):
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
         return
     
-    text = "📋 **Твои активные квесты:**\n\n"
+    text = "📋 **Твои активные квесты:**\\n\\n"
     keyboard = []
     
     for quest in quests:
@@ -451,7 +400,7 @@ async def handle_my_quests(query, context):
         else:
             progress = f"{current_value}%"
         
-        text += f"{type_emoji} {title} - {progress}\n"
+        text += f"{type_emoji} {title} - {progress}\\n"
         keyboard.append([InlineKeyboardButton(f"{type_emoji} {title}", callback_data=f"quest_{quest_id}")])
     
     keyboard.append([InlineKeyboardButton("➕ Создать квест", callback_data="create_quest")])
@@ -505,9 +454,9 @@ async def handle_progress_update(query, context):
     context.user_data["quest_type"] = quest_type
     
     if quest_type in ["physical", "intellectual"]:
-        text = f"Текущий прогресс: {current_value}/{target_value}\n\nВведи новое значение:\n**Пример:** 25"
+        text = f"Текущий прогресс: {current_value}/{target_value}\\n\\nВведи новое значение:\\n**Пример:** 25"
     else:
-        text = f"Текущий прогресс: {current_value}%\n\nВведи процент (0-100):\n**Пример:** 75"
+        text = f"Текущий прогресс: {current_value}%\\n\\nВведи процент (0-100):\\n**Пример:** 75"
     
     keyboard = [[InlineKeyboardButton("❌ Отменить", callback_data=f"quest_{quest_id}")]]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
@@ -544,7 +493,7 @@ async def handle_edit_quest(query, context):
         await query.answer("Квест не найден")
         return
     
-    text = f"✏️ **Редактирование квеста**\n\n{quest[2]}\n\nЧто хочешь изменить?"
+    text = f"✏️ **Редактирование квеста**\\n\\n{quest[2]}\\n\\nЧто хочешь изменить?"
     await query.edit_message_text(text, reply_markup=get_edit_quest_keyboard(quest_id), parse_mode='Markdown')
 
 
@@ -566,18 +515,18 @@ async def handle_edit_field(query, context):
     keyboard = [[InlineKeyboardButton("❌ Отменить", callback_data=f"edit_{quest_id}")]]
     
     if field == "title":
-        text = "Введи новое название квеста:\n\n**Пример:** Вечерняя пробежка"
+        text = "Введи новое название квеста:\\n\\n**Пример:** Вечерняя пробежка"
     elif field == "target":
         quest_type = quest[3]
         if quest_type in ["physical", "intellectual"]:
-            text = "Введи новое целевое значение:\n\n**Пример:** 100"
+            text = "Введи новое целевое значение:\\n\\n**Пример:** 100"
         else:
             await query.answer("Для ментальных задач целевое значение всегда 100%")
             return
     elif field == "deadline":
-        text = "Введи новый дедлайн:\n\n**Форматы:**\n• ДД.ММ.ГГ ЧЧ:ММ\n• ДД.ММ.ГГ\n• 'нет' - удалить"
+        text = "Введи новый дедлайн:\\n\\n**Форматы:**\\n• ДД.ММ.ГГ ЧЧ:ММ\\n• ДД.ММ.ГГ\\n• 'нет' - удалить"
     elif field == "comment":
-        text = "Введи новый комментарий:\n\n**Пример:** Важно не забыть!"
+        text = "Введи новый комментарий:\\n\\n**Пример:** Важно не забыть!"
     else:
         await query.answer("Неизвестное поле")
         return
@@ -599,7 +548,7 @@ async def handle_delete_quest(query, context):
         await query.answer("Квест не найден")
         return
     
-    text = f"⚠️ Ты уверен, что хочешь удалить квест?\n\n**{quest[2]}**\n\nЭто действие нельзя отменить!"
+    text = f"⚠️ Ты уверен, что хочешь удалить квест?\\n\\n**{quest[2]}**\\n\\nЭто действие нельзя отменить!"
     keyboard = [
         [InlineKeyboardButton("✅ Да, удалить", callback_data=f"confirm_delete_{quest_id}")],
         [InlineKeyboardButton("❌ Отмена", callback_data=f"quest_{quest_id}")]
@@ -625,13 +574,13 @@ async def handle_confirm_delete(query, context):
 
 
 async def handle_stats(query, context):
-    text = "📊 **Статистика**\n\nРаздел в разработке 🚧"
+    text = "📊 **Статистика**\\n\\nРаздел в разработке 🚧"
     keyboard = [[InlineKeyboardButton("🔙 Главное меню", callback_data="main_menu")]]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
 
 async def handle_help(query, context):
-    text = "❓ **Помощь**\n\nРаздел в разработке 🚧"
+    text = "❓ **Помощь**\\n\\nРаздел в разработке 🚧"
     keyboard = [[InlineKeyboardButton("🔙 Главное меню", callback_data="main_menu")]]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
@@ -642,78 +591,18 @@ async def handle_cancel_creation(query, context):
     await handle_quests_menu(query, context)
 
 
+'''
 
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    data = query.data
-    
-    # Главное меню
-    if data == "main_menu":
-        await handle_main_menu(query, context)
-    elif data == "quests_menu":
-        await handle_quests_menu(query, context)
-    elif data == "create_quest":
-        await handle_create_quest(query, context)
-    elif data == "my_quests":
-        await handle_my_quests(query, context)
-    elif data == "stats":
-        await handle_stats(query, context)
-    elif data == "help":
-        await handle_help(query, context)
-    elif data == "cancel_creation":
-        await handle_cancel_creation(query, context)
-    
-    # Типы квестов
-    elif data.startswith("type_"):
-        await handle_quest_type_selection(query, context)
-    
-    # Детали квеста
-    elif data.startswith("quest_") and not data.startswith("quest_type"):
-        await handle_quest_detail(query, context)
-    
-    # Обновление прогресса
-    elif data.startswith("progress_"):
-        await handle_progress_update(query, context)
-    
-    # Завершение квеста
-    elif data.startswith("complete_"):
-        await handle_complete_quest(query, context)
-    
-    # Редактирование
-    elif data.startswith("edit_") and not data.startswith("edit_title") and not data.startswith("edit_target") and not data.startswith("edit_deadline") and not data.startswith("edit_comment"):
-        await handle_edit_quest(query, context)
-    elif data.startswith("edit_title_") or data.startswith("edit_target_") or data.startswith("edit_deadline_") or data.startswith("edit_comment_"):
-        await handle_edit_field(query, context)
-    
-    # Удаление
-    elif data.startswith("delete_"):
-        await handle_delete_quest(query, context)
-    elif data.startswith("confirm_delete_"):
-        await handle_confirm_delete(query, context)
-    
-    else:
-        await query.edit_message_text("Неизвестная команда")
+# Берем начало файла (импорты и вспомогательные функции)
+file_start = current[:handlers_start]
 
+# Собираем полный новый файл
+full_new_code = file_start + new_handlers + new_text_handler + new_button_callback + main_code
 
-def main():
-    # Создаем приложение и передаем ему токен
-    application = Application.builder().token(TOKEN).build()
+# Записываем новый bot.py
+with open('bot.py', 'w', encoding='utf-8') as f:
+    f.write(full_new_code)
 
-    # Добавляем обработчики команд
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", help_command))
-
-    # Единый обработчик текстовых сообщений по состояниям
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
-
-    # Обработчик для INLINE-КНОПОК
-    application.add_handler(CallbackQueryHandler(button_callback))
-
-    # Запускаем бота
-    print("Бот запущен...")
-    application.run_polling()
-
-if __name__ == '__main__':
-    main()
+print("✅ Обновление применено успешно!")
+print("📊 Размер нового файла:", len(full_new_code), "символов")
+print("\n🚀 Запустите бота: python bot.py")
