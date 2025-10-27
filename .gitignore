@@ -1,13 +1,36 @@
-# Виртуальное окружение
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
 venv/
+env/
+ENV/
+
+# Environment variables
 .env
 
-# Кэш Python
-__pycache__/
-*.pyc
+# Database
+*.db
+*.sqlite
+*.sqlite3
 
-# Настройки IDE
+# Logs
+*.log
+bot.log
+
+# IDE
 .vscode/
 .idea/
 *.swp
 *.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+quests.db
+quests_new.db
+output.log
