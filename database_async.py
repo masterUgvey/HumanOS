@@ -170,6 +170,30 @@ class Database:
                 return None, error_msg
         
         try:
+            # Нормализуем пустые значения
+            if not deadline or str(deadline).strip() == "" or str(deadline).strip().lower() in {"none", "null", "0"}:
+                deadline = None
+            else:
+                # Если передана только дата, приводим к 'YYYY-MM-DD 00:00:00'
+                d_str = str(deadline).strip()
+                if re.fullmatch(r"\d{4}-\d{2}-\d{2}$", d_str):
+                    deadline = f"{d_str} 00:00:00"
+            # Не сохраняем комментарий, если он пустой или выглядит как дата/дата-время
+            if comment is not None:
+                c = str(comment).strip()
+                if c == "":
+                    comment = None
+                else:
+                    date_like = [
+                        r"^\d{4}-\d{2}-\d{2}$",
+                        r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$",
+                        r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$",
+                        r"^\d{2}\.\d{2}\.\d{2}$",
+                        r"^\d{2}\.\d{2}\.\d{2} \d{2}:\d{2}$",
+                    ]
+                    if any(re.fullmatch(p, c) for p in date_like) or (deadline and c == str(deadline)):
+                        comment = None
+            logger.info(f"[DB] create_quest normalized -> user_id={user_id}, title='{title}', type='{quest_type}', target={target_value}, deadline='{deadline}', comment='{comment}'")
             async with aiosqlite.connect(self.db_path) as db:
                 cursor = await db.execute(
                     '''INSERT INTO quests (user_id, title, quest_type, target_value, deadline, comment) 
@@ -201,6 +225,63 @@ class Database:
             )
             quests = await cursor.fetchall()
             return quests
+
+    async def sanitize_existing_data(self) -> None:
+        """Привести БД в порядок:
+        - Удалить датоподобные комментарии
+        - Нормализовать дедлайны с только датой -> 'YYYY-MM-DD 00:00:00'
+        - Исправить баг 'вчера + время' на дату создания '00:00:00'
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            total = 0
+            # 1) Удаляем комментарии, похожие на дату, или совпадающие с дедлайном
+            # Используем GLOB/LIKE из-за отсутствия REGEXP в SQLite по умолчанию
+            res = await db.execute(
+                """
+                UPDATE quests
+                SET comment = NULL
+                WHERE comment IS NOT NULL AND (
+                    comment = deadline OR
+                    comment GLOB '____-__-__' OR
+                    comment GLOB '____-__-__ *__:__*' OR
+                    comment GLOB '__.__.__' OR
+                    comment GLOB '__.__.__ *__:__*'
+                )
+                """
+            )
+            c1 = res.rowcount if res.rowcount is not None else 0
+            total += c1
+            logger.info(f"[SANITIZE] cleared date-like comments: {c1}")
+
+            # 2) Нормализуем дедлайны, где указана только дата (10 символов)
+            res = await db.execute(
+                """
+                UPDATE quests
+                SET deadline = deadline || ' 00:00:00'
+                WHERE deadline IS NOT NULL AND LENGTH(deadline) = 10 AND deadline GLOB '____-__-__'
+                """
+            )
+            c2 = res.rowcount if res.rowcount is not None else 0
+            total += c2
+            logger.info(f"[SANITIZE] normalized pure date deadlines to 00:00:00: {c2}")
+
+            # 3) Исправляем дедлайны со сдвигом на 'вчера' с временем — ставим дату создания 00:00:00
+            # Признак бага: date(deadline) = date(created_at, '-1 day') и time(deadline) != '00:00:00'
+            res = await db.execute(
+                """
+                UPDATE quests
+                SET deadline = DATE(created_at) || ' 00:00:00'
+                WHERE deadline IS NOT NULL
+                  AND TIME(deadline) != '00:00:00'
+                  AND DATE(deadline) = DATE(created_at, '-1 day')
+                """
+            )
+            c3 = res.rowcount if res.rowcount is not None else 0
+            total += c3
+            logger.info(f"[SANITIZE] fixed previous-day-with-time deadlines: {c3}")
+
+            await db.commit()
+            logger.info(f"[SANITIZE] done. total rows affected: {total}")
     
     async def get_quest(self, user_id: int, quest_id: int) -> Optional[tuple]:
         """
@@ -370,12 +451,44 @@ class Database:
         if target_value is not None:
             updates.append('target_value = ?')
             params.append(target_value)
+        # Обработка deadline: пустая строка означает очистку поля (NULL)
         if deadline is not None:
-            updates.append('deadline = ?')
-            params.append(deadline)
+            if isinstance(deadline, str):
+                dstr = deadline.strip()
+                if dstr == "":
+                    updates.append('deadline = NULL')
+                else:
+                    # Если только дата, приводим к 'YYYY-MM-DD 00:00:00'
+                    if re.fullmatch(r"\d{4}-\d{2}-\d{2}$", dstr):
+                        dstr = f"{dstr} 00:00:00"
+                    updates.append('deadline = ?')
+                    params.append(dstr)
+            else:
+                updates.append('deadline = ?')
+                params.append(deadline)
+        # Обработка comment: пустая строка означает очистку поля (NULL) и фильтрация датоподобных значений
         if comment is not None:
-            updates.append('comment = ?')
-            params.append(comment)
+            if isinstance(comment, str):
+                c = comment.strip()
+                if c == "":
+                    updates.append('comment = NULL')
+                else:
+                    date_like = [
+                        r"^\d{4}-\d{2}-\d{2}$",
+                        r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$",
+                        r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$",
+                        r"^\d{2}\.\d{2}\.\d{2}$",
+                        r"^\d{2}\.\d{2}\.\d{2} \d{2}:\d{2}$",
+                    ]
+                    if any(re.fullmatch(p, c) for p in date_like):
+                        updates.append('comment = NULL')
+                    else:
+                        updates.append('comment = ?')
+                        params.append(c)
+            else:
+                updates.append('comment = ?')
+                params.append(comment)
+        logger.info(f"[DB] update_quest -> quest_id={quest_id}, user_id={user_id}, updates={updates}, params={params}")
         
         if not updates:
             return None, "Нет данных для обновления"

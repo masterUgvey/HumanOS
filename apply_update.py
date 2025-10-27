@@ -377,7 +377,6 @@ async def handle_my_quests(query, context):
     if not quests:
         text = "📋 У тебя пока нет активных квестов!\\n\\nСоздай свой первый квест! 💪"
         keyboard = [
-            [InlineKeyboardButton("➕ Создать квест", callback_data="create_quest")],
             [InlineKeyboardButton("🔙 Назад", callback_data="quests_menu")]
         ]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -403,7 +402,6 @@ async def handle_my_quests(query, context):
         text += f"{type_emoji} {title} - {progress}\\n"
         keyboard.append([InlineKeyboardButton(f"{type_emoji} {title}", callback_data=f"quest_{quest_id}")])
     
-    keyboard.append([InlineKeyboardButton("➕ Создать квест", callback_data="create_quest")])
     keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="quests_menu")])
     
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')

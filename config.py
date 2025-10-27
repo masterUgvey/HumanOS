@@ -29,10 +29,10 @@ class Config:
     
     # Типы квестов
     QUEST_TYPES = {
-        "physical": "💪 Физическая задача",
+        "physical": "💪 Физические упражнения",
         "intellectual": "📚 Интеллектуальная задача",
         "mental": "🧠 Ментальная задача",
-        "custom": "🎯 Произвольная задача"
+        "custom": "🎯 Произвольный квест"
     }
     
     @classmethod
