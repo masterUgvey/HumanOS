@@ -17,6 +17,12 @@ from aiogram.types import (
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from datetime import datetime
+from datetime_utils import (
+    today_deadline_str,
+    normalize_user_deadline_input,
+    comment_should_be_saved,
+    format_deadline_for_display,
+)
 from loguru import logger
 
 from database_async import db
@@ -121,45 +127,10 @@ def format_quest_text(quest: tuple) -> str:
     text += f"Прогресс: {progress_text}\n"
     text += f"Статус: {status}\n"
     
-    if deadline:
-        try:
-            # Полная дата-время
-            if ":" in deadline:
-                try:
-                    d = datetime.strptime(deadline, "%Y-%m-%d %H:%M:%S")
-                except ValueError:
-                    d = datetime.strptime(deadline, "%Y-%m-%d %H:%M")
-                if d.hour == 0 and d.minute == 0:
-                    text += f"📅 Дедлайн: {d.strftime('%d.%m.%y')} (без времени)\n"
-                else:
-                    text += f"📅 Дедлайн: {d.strftime('%d.%m.%y %H:%M')}\n"
-            else:
-                # Только дата без времени
-                d = datetime.strptime(deadline, "%Y-%m-%d")
-                text += f"📅 Дедлайн: {d.strftime('%d.%m.%y')} (без времени)\n"
-        except Exception:
-            # Непредвидимый формат — не отображаем
-            text += "📅 Дедлайн: без даты и времени\n"
-    else:
-        text += "📅 Дедлайн: без даты и времени\n"
+    text += f"📅 Дедлайн: {format_deadline_for_display(deadline)}\n"
     
-    if comment:
-        # Не показываем датоподобные комментарии или те, что совпадают с дедлайном
-        try:
-            import re
-            patterns = [
-                r"^\d{4}-\d{2}-\d{2}$",
-                r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$",
-                r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$",
-                r"^\d{2}\.\d{2}\.\d{2}$",
-                r"^\d{2}\.\d{2}\.\d{2} \d{2}:\d{2}$",
-            ]
-            if comment == (deadline or "") or any(re.fullmatch(p, comment) for p in patterns):
-                pass
-            else:
-                text += f"\n💬 Комментарий: {comment}\n"
-        except Exception:
-            text += f"\n💬 Комментарий: {comment}\n"
+    if comment and comment_should_be_saved(str(comment), deadline):
+        text += f"\n💬 Комментарий: {comment}\n"
     
     return text
 
@@ -553,7 +524,7 @@ async def cb_skip_deadline(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "set_deadline_today")
 async def cb_set_deadline_today(callback: CallbackQuery, state: FSMContext):
     # Установить текущую локальную дату как 00:00:00 (YYYY-MM-DD 00:00:00) и перейти к комментарию
-    today_str = datetime.now().strftime("%Y-%m-%d 00:00:00")
+    today_str = today_deadline_str()
     await state.update_data(deadline=today_str)
     data = await state.get_data()
     logger.info(f"[CREATE] set_deadline_today by {callback.from_user.id} -> deadline: {today_str}, state: {data}")
@@ -570,23 +541,7 @@ async def process_quest_deadline(message: Message, state: FSMContext):
     """Ввод даты дедлайна после выбора Да"""
     text = message.text.strip()
     try:
-        text_normalized = text.replace('/', '.').replace('-', '.')
-        if ' ' in text_normalized and ':' in text_normalized:
-            # Пользователь указал дату и время
-            dt = datetime.strptime(text_normalized, "%d.%m.%y %H:%M")
-            if dt < datetime.now():
-                await message.answer("❌ Нельзя установить прошедшую дату и время!")
-                return
-            # Сохраняем без секунд
-            deadline = dt.strftime("%Y-%m-%d %H:%M")
-        else:
-            # Только дата: валидируем по концу дня, сохраняем как 00:00:00
-            d = datetime.strptime(text_normalized, "%d.%m.%y")
-            end_of_day = d.replace(hour=23, minute=59)
-            if end_of_day < datetime.now():
-                await message.answer("❌ Нельзя установить прошедшую дату!")
-                return
-            deadline = d.strftime("%Y-%m-%d 00:00:00")
+        deadline = normalize_user_deadline_input(text)
         logger.info(f"[CREATE] parse_deadline by {message.from_user.id} -> input: '{text}', normalized: '{deadline}'")
     except ValueError:
         await message.answer("❌ Неверный формат даты!\nИспользуй: ДД.ММ.ГГ или ДД.ММ.ГГ ЧЧ:ММ")
@@ -657,24 +612,14 @@ async def cb_skip_comment(callback: CallbackQuery, state: FSMContext):
 async def process_quest_comment(message: Message, state: FSMContext):
     """Обработка комментария (текст) и создание квеста"""
     text = message.text.strip()
-    # Не сохраняем даты как комментарии (часто пользователи случайно отправляют дату)
     data = await state.get_data()
     deadline_in_state = data.get("deadline")
-    date_like_patterns = [
-        r"^\d{4}-\d{2}-\d{2}$",
-        r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$",
-        r"^\d{2}\.\d{2}\.\d{2}$",
-        r"^\d{2}\.\d{2}\.\d{2} \d{2}:\d{2}$",
-    ]
-    import re
-    if (deadline_in_state and text == str(deadline_in_state)) or any(re.match(p, text) for p in date_like_patterns):
-        comment = None
-    else:
-        is_valid, error_msg = db.validate_input(text, "Комментарий")
+    comment = text if comment_should_be_saved(text, deadline_in_state) else None
+    if comment:
+        is_valid, error_msg = db.validate_input(comment, "Комментарий")
         if not is_valid:
             await message.answer(f"❌ {error_msg}")
             return
-        comment = text
     logger.info(f"[CREATE] comment by {message.from_user.id} -> raw='{text}', saved='{comment}', deadline_in_state='{deadline_in_state}'")
     # Гарантируем, что пользователь существует в БД
     await db.add_user(message.from_user.id, message.from_user.first_name or message.from_user.username or "User")
