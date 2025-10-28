@@ -1,5 +1,5 @@
 from __future__ import annotations
-from datetime import datetime
+from datetime import datetime, timedelta
 import re
 
 # Timezone-agnostic approach: we operate on naive local datetimes and avoid auto-generated times
@@ -9,12 +9,38 @@ DATE_ONLY_FMT = "%Y-%m-%d"
 DATETIME_FMT_MIN = "%Y-%m-%d %H:%M"
 DATETIME_FMT_SEC = "%Y-%m-%d %H:%M:%S"
 
-def today_deadline_str() -> str:
-    """Return today's local date as 'YYYY-MM-DD 00:00:00'."""
-    return datetime.now().strftime(f"{DATE_ONLY_FMT} 00:00:00")
+def today_deadline_str(ref_dt: datetime | None = None, offset_minutes: int = 0) -> str:
+    """Return today's local date as 'YYYY-MM-DD 00:00:00'.
+
+    If ref_dt is provided (e.g., Telegram message/callback date in UTC),
+    we compute local date by applying offset_minutes.
+    """
+    base = ref_dt or datetime.now()
+    # Normalize: treat base as UTC-like and shift by offset to get user's local
+    local = base + timedelta(minutes=offset_minutes)
+    return local.strftime(f"{DATE_ONLY_FMT} 00:00:00")
+
+def combine_date_and_time(date_str: str, time_hhmm: str) -> str:
+    """Combine 'YYYY-MM-DD' and 'HH:MM' into 'YYYY-MM-DD HH:MM'.
+    Raises ValueError if formats are invalid.
+    """
+    # Validate date
+    try:
+        d = datetime.strptime(date_str.strip(), DATE_ONLY_FMT)
+    except Exception as e:
+        raise ValueError("invalid date format") from e
+    # Validate time
+    if not re.fullmatch(r"^\d{2}:\d{2}$", time_hhmm.strip()):
+        raise ValueError("invalid time format")
+    hh, mm = time_hhmm.split(":")
+    try:
+        dt = d.replace(hour=int(hh), minute=int(mm))
+    except Exception as e:
+        raise ValueError("invalid time value") from e
+    return dt.strftime(DATETIME_FMT_MIN)
 
 
-def normalize_user_deadline_input(text: str) -> str:
+def normalize_user_deadline_input(text: str, ref_now: datetime | None = None) -> str:
     """Normalize user input into DB string.
     Accepts:
     - 'DD.MM.YY'
@@ -28,7 +54,7 @@ def normalize_user_deadline_input(text: str) -> str:
     if not s:
         raise ValueError("empty")
     s_norm = s.replace('/', '.').replace('-', '.')
-    now = datetime.now()
+    now = ref_now or datetime.now()
     if ' ' in s_norm and ':' in s_norm:
         dt = datetime.strptime(s_norm, "%d.%m.%y %H:%M")
         if dt < now:

@@ -18,10 +18,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from datetime import datetime
 from datetime_utils import (
-    today_deadline_str,
-    normalize_user_deadline_input,
     comment_should_be_saved,
-    format_deadline_for_display,
 )
 from loguru import logger
 
@@ -31,6 +28,9 @@ from config import config
 
 # Создаем роутер для обработчиков
 router = Router()
+
+# Активные сессии медитации: {(user_id, quest_id): {"start": datetime, "task": asyncio.Task}}
+MEDITATION_SESSIONS = {}
 
 
 # FSM States для управления состояниями диалога
@@ -44,7 +44,6 @@ class QuestCreation(StatesGroup):
     waiting_for_pages = State()
     waiting_for_minutes = State()
     waiting_for_progress = State()
-    waiting_for_deadline = State()
     waiting_for_comment = State()
 
 
@@ -52,7 +51,6 @@ class QuestEdit(StatesGroup):
     """Состояния редактирования квеста"""
     waiting_for_title = State()
     waiting_for_target = State()
-    waiting_for_deadline = State()
     waiting_for_comment = State()
 
 
@@ -77,6 +75,12 @@ def get_main_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True, one_time_keyboard=False)
 
 
+def get_cancel_keyboard() -> ReplyKeyboardMarkup:
+    """Клавиатура отмены при создании квеста"""
+    keyboard = [[KeyboardButton(text="Отмена")]]
+    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True, one_time_keyboard=False)
+
+
 def get_quests_menu_keyboard() -> ReplyKeyboardMarkup:
     """Меню квестов (ReplyKeyboard)"""
     keyboard = [
@@ -97,12 +101,16 @@ def get_quest_type_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True, one_time_keyboard=False)
 
 
-def get_quest_detail_keyboard(quest_id: int, completed: bool, quest_type: str) -> InlineKeyboardMarkup:
+def get_quest_detail_keyboard(quest_id: int, completed: bool, quest_type: str, target_value: int) -> InlineKeyboardMarkup:
     keyboard = []
-    if not completed:
+    # Кнопка обновления прогресса скрыта для: custom без шкалы и для медитации
+    if not completed and not (quest_type == "custom" and target_value == 0) and quest_type != "mental":
         keyboard.append([InlineKeyboardButton(text="📈 Обновить прогресс", callback_data=f"progress_{quest_id}")])
+    # Кнопку завершить показываем для всех незавершённых (включая custom без шкалы и медитацию)
+    if not completed:
         keyboard.append([InlineKeyboardButton(text="✅ Завершить", callback_data=f"complete_{quest_id}")])
     keyboard.append([InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"edit_{quest_id}")])
+    keyboard.append([InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete_{quest_id}")])
     if quest_type == "mental":
         keyboard.append([InlineKeyboardButton(text="▶️ Начать медитацию", callback_data=f"meditate_{quest_id}")])
     keyboard.append([InlineKeyboardButton(text="🔙 К списку", callback_data="my_quests_inline")])
@@ -118,18 +126,18 @@ def format_quest_text(quest: tuple) -> str:
     if quest_type in ["physical", "intellectual", "mental"]:
         progress_text = f"{current_value}/{target_value}"
     else:
-        progress_text = f"{current_value}%"
+        # Произвольный без прогресса (target_value == 0) — скрываем строку прогресса
+        progress_text = None if int(target_value or 0) == 0 else f"{current_value}%"
     
     status = "✅ Завершен" if completed else "⏳ В процессе"
     
     text = f"{type_emoji} <b>{title}</b>\nID: {quest_id}\n\n"
     text += f"Тип: {config.QUEST_TYPES.get(quest_type, quest_type)}\n"
-    text += f"Прогресс: {progress_text}\n"
+    if progress_text is not None:
+        text += f"Прогресс: {progress_text}\n"
     text += f"Статус: {status}\n"
     
-    text += f"📅 Дедлайн: {format_deadline_for_display(deadline)}\n"
-    
-    if comment and comment_should_be_saved(str(comment), deadline):
+    if comment and comment_should_be_saved(str(comment), None):
         text += f"\n💬 Комментарий: {comment}\n"
     
     return text
@@ -278,11 +286,9 @@ async def go_back_to_main(message: Message, state: FSMContext):
         QuestCreation.waiting_for_pages.state,
         QuestCreation.waiting_for_minutes.state,
         QuestCreation.waiting_for_progress.state,
-        QuestCreation.waiting_for_deadline.state,
         QuestCreation.waiting_for_comment.state,
         QuestEdit.waiting_for_title.state,
         QuestEdit.waiting_for_target.state,
-        QuestEdit.waiting_for_deadline.state,
         QuestEdit.waiting_for_comment.state,
         QuestProgress.waiting_for_value.state,
     }:
@@ -303,28 +309,11 @@ async def menu_my_quests(message: Message, state: FSMContext):
         await message.answer("📋 У тебя пока нет активных квестов!")
         return
     keyboard = []
-    now = datetime.now()
     for quest in quests:
         quest_id = quest[0]
         title = quest[2]
         quest_type = quest[3]
-        deadline = quest[7]
-        # Рассчитываем статус по дедлайну
         status_emoji = "⚪"
-        if deadline:
-            try:
-                d = datetime.strptime(deadline, "%Y-%m-%d %H:%M:%S")
-                # Если время 00:00, считаем как 23:00 этого дня
-                if d.hour == 0 and d.minute == 0:
-                    d = d.replace(hour=23, minute=0)
-                if now > d:
-                    status_emoji = "🔴"
-                else:
-                    seconds_left = (d - now).total_seconds()
-                    if seconds_left <= 3600:
-                        status_emoji = "🟡"
-            except Exception:
-                pass
         type_emoji = {"physical": "💪", "intellectual": "📚", "mental": "🧠", "custom": "🎯"}.get(quest_type, "🎯")
         keyboard.append([InlineKeyboardButton(text=f"{status_emoji} {type_emoji} {title}", callback_data=f"quest_{quest_id}")])
     await message.answer("📋 Выбери квест:", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
@@ -352,9 +341,21 @@ async def select_quest_type(message: Message, state: FSMContext):
     }
     quest_type = mapping.get(message.text)
     await state.update_data(quest_type=quest_type)
+    # Медитация: пропускаем ввод названия, задаем дефолт и спрашиваем только минуты
+    if quest_type == "mental":
+        await state.update_data(title="Медитация")
+        await state.set_state(QuestCreation.waiting_for_minutes)
+        await message.answer("Тип квеста: медитация\n\nСколько минут медитации? (число):", reply_markup=get_cancel_keyboard())
+        return
+    # Чтение: особый текст запроса названия
+    if quest_type == "intellectual":
+        await state.set_state(QuestCreation.waiting_for_title)
+        await message.answer("тип квеста: чтение\n\nвведите название книги:", reply_markup=get_cancel_keyboard())
+        return
+    # Остальные типы — стандартное сообщение
     await state.set_state(QuestCreation.waiting_for_title)
     type_name = config.QUEST_TYPES.get(quest_type, "Квест")
-    await message.answer(f"Тип квеста: {type_name}\n\nВведи название квеста:", reply_markup=ReplyKeyboardRemove())
+    await message.answer(f"Тип квеста: {type_name}\n\nВведи название квеста:", reply_markup=get_cancel_keyboard())
 
 
 @router.message(QuestCreation.waiting_for_title)
@@ -391,7 +392,7 @@ async def process_quest_title(message: Message, state: FSMContext):
         await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
         return
     
-    await message.answer(text, reply_markup=ReplyKeyboardRemove())
+    await message.answer(text, reply_markup=get_cancel_keyboard())
 
 @router.message(QuestCreation.waiting_for_reps)
 async def process_reps(message: Message, state: FSMContext):
@@ -404,7 +405,7 @@ async def process_reps(message: Message, state: FSMContext):
         return
     await state.update_data(reps=reps)
     await state.set_state(QuestCreation.waiting_for_sets)
-    await message.answer("Введи количество подходов (число):")
+    await message.answer("Введи количество подходов (число):", reply_markup=get_cancel_keyboard())
 
 @router.message(QuestCreation.waiting_for_sets)
 async def process_sets(message: Message, state: FSMContext):
@@ -419,13 +420,10 @@ async def process_sets(message: Message, state: FSMContext):
     reps = data.get("reps", 0)
     target_value = reps * sets
     await state.update_data(target_value=target_value)
-    await state.set_state(QuestCreation.waiting_for_deadline)
-    keyboard = [[
-        InlineKeyboardButton(text="Пропустить", callback_data="skip_deadline"),
-        InlineKeyboardButton(text="Сегодня", callback_data="set_deadline_today")
-    ]]
+    await state.set_state(QuestCreation.waiting_for_comment)
+    keyboard = [[InlineKeyboardButton(text="Пропустить", callback_data="skip_comment")]]
     await message.answer(
-        "Укажи дедлайн в формате: ДД.ММ.ГГ или ДД.ММ.ГГ ЧЧ:ММ",
+        "Добавьте комментарий (введите текст сообщением)",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
     )
 
@@ -439,13 +437,10 @@ async def process_pages(message: Message, state: FSMContext):
         await message.answer("❌ Значение должно быть больше 0")
         return
     await state.update_data(target_value=pages)
-    await state.set_state(QuestCreation.waiting_for_deadline)
-    keyboard = [[
-        InlineKeyboardButton(text="Пропустить", callback_data="skip_deadline"),
-        InlineKeyboardButton(text="Сегодня", callback_data="set_deadline_today")
-    ]]
+    await state.set_state(QuestCreation.waiting_for_comment)
+    keyboard = [[InlineKeyboardButton(text="Пропустить", callback_data="skip_comment")]]
     await message.answer(
-        "Укажи дедлайн в формате: ДД.ММ.ГГ или ДД.ММ.ГГ ЧЧ:ММ",
+        "Добавьте комментарий (введите текст сообщением)",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
     )
 
@@ -459,28 +454,22 @@ async def process_minutes(message: Message, state: FSMContext):
         await message.answer("❌ Значение должно быть больше 0")
         return
     await state.update_data(target_value=minutes)
-    await state.set_state(QuestCreation.waiting_for_deadline)
-    keyboard = [[
-        InlineKeyboardButton(text="Пропустить", callback_data="skip_deadline"),
-        InlineKeyboardButton(text="Сегодня", callback_data="set_deadline_today")
-    ]]
+    await state.set_state(QuestCreation.waiting_for_comment)
+    keyboard = [[InlineKeyboardButton(text="Пропустить", callback_data="skip_comment")]]
     await message.answer(
-        "Укажи дедлайн в формате: ДД.ММ.ГГ или ДД.ММ.ГГ ЧЧ:ММ",
+        "Добавьте комментарий (введите текст сообщением)",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
     )
 
 @router.callback_query(F.data.in_(["custom_progress_yes", "custom_progress_no"]))
 async def cb_custom_progress(callback: CallbackQuery, state: FSMContext):
-    done = callback.data.endswith("yes")
-    await state.update_data(target_value=1, custom_initial_done=done)
-    # Переход к дедлайну: инструкция + Пропустить
-    await state.set_state(QuestCreation.waiting_for_deadline)
-    keyboard = [[
-        InlineKeyboardButton(text="Пропустить", callback_data="skip_deadline"),
-        InlineKeyboardButton(text="Сегодня", callback_data="set_deadline_today")
-    ]]
+    has_progress = callback.data.endswith("yes")
+    # Если есть прогресс — шкала 0..100, иначе без прогресса (target_value=0)
+    await state.update_data(target_value=(100 if has_progress else 0), custom_has_progress=has_progress)
+    await state.set_state(QuestCreation.waiting_for_comment)
+    keyboard = [[InlineKeyboardButton(text="Пропустить", callback_data="skip_comment")]]
     await callback.message.edit_text(
-        "Укажи дедлайн в формате: ДД.ММ.ГГ или ДД.ММ.ГГ ЧЧ:ММ",
+        "Добавьте комментарий (введите текст сообщением)",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
     )
     await callback.answer()
@@ -499,110 +488,42 @@ async def process_quest_target(message: Message, state: FSMContext):
         return
     
     await state.update_data(target_value=target_value)
-    await state.set_state(QuestCreation.waiting_for_deadline)
-    keyboard = [[InlineKeyboardButton(text="Пропустить", callback_data="skip_deadline")]]
-    await message.answer(
-        "Укажи дедлайн в формате: ДД.ММ.ГГ или ДД.ММ.ГГ ЧЧ:ММ",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
-    )
-
-
-@router.callback_query(F.data == "skip_deadline")
-async def cb_skip_deadline(callback: CallbackQuery, state: FSMContext):
-    await state.update_data(deadline=None)
-    # Переходим к комментарию: текст + Пропустить
-    await state.set_state(QuestCreation.waiting_for_comment)
-    data = await state.get_data()
-    logger.info(f"[CREATE] skip_deadline by {callback.from_user.id} -> state: {data}")
-    keyboard = [[InlineKeyboardButton(text="Пропустить", callback_data="skip_comment")]]
-    await callback.message.edit_text(
-        "Добавьте комментарий (введите текст сообщением)",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
-    )
-    await callback.answer()
-
-@router.callback_query(F.data == "set_deadline_today")
-async def cb_set_deadline_today(callback: CallbackQuery, state: FSMContext):
-    # Установить текущую локальную дату как 00:00:00 (YYYY-MM-DD 00:00:00) и перейти к комментарию
-    today_str = today_deadline_str()
-    await state.update_data(deadline=today_str)
-    data = await state.get_data()
-    logger.info(f"[CREATE] set_deadline_today by {callback.from_user.id} -> deadline: {today_str}, state: {data}")
     await state.set_state(QuestCreation.waiting_for_comment)
     keyboard = [[InlineKeyboardButton(text="Пропустить", callback_data="skip_comment")]]
-    await callback.message.edit_text(
-        "Добавьте комментарий (введите текст сообщением)",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
-    )
-    await callback.answer()
-
-@router.message(QuestCreation.waiting_for_deadline)
-async def process_quest_deadline(message: Message, state: FSMContext):
-    """Ввод даты дедлайна после выбора Да"""
-    text = message.text.strip()
-    try:
-        deadline = normalize_user_deadline_input(text)
-        logger.info(f"[CREATE] parse_deadline by {message.from_user.id} -> input: '{text}', normalized: '{deadline}'")
-    except ValueError:
-        await message.answer("❌ Неверный формат даты!\nИспользуй: ДД.ММ.ГГ или ДД.ММ.ГГ ЧЧ:ММ")
-        return
-    await state.update_data(deadline=deadline)
-    # Переход к комментарию: текст + Пропустить
-    keyboard = [[InlineKeyboardButton(text="Пропустить", callback_data="skip_comment")]]
-    await state.set_state(QuestCreation.waiting_for_comment)
     await message.answer(
         "Добавьте комментарий (введите текст сообщением)",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
     )
-
 
 @router.callback_query(F.data == "skip_comment")
 async def cb_skip_comment(callback: CallbackQuery, state: FSMContext):
-    # Создаем квест без комментария
     user = callback.from_user
     await db.add_user(user.id, user.first_name or user.username or "User")
     data = await state.get_data()
-    logger.info(f"[CREATE] skip_comment by {user.id} -> creating with: title='{data.get('title')}', quest_type='{data.get('quest_type')}', target='{data.get('target_value')}', deadline='{data.get('deadline')}', comment=None")
     quest_id, error = await db.create_quest(
         user_id=user.id,
         title=data["title"],
         quest_type=data["quest_type"],
         target_value=data["target_value"],
-        deadline=data.get("deadline"),
-        comment=None
+        comment=None,
+        deadline=None,
     )
     if error:
         await state.clear()
         await callback.message.edit_text(f"❌ Ошибка: {error}")
     else:
-        if data.get("quest_type") == "custom" and data.get("custom_initial_done") and quest_id:
-            await db.update_quest_progress(user.id, quest_id, 1)
         await state.clear()
-        # Показать список квестов (inline) без кнопки создания
+        # Показать список квестов (inline)
         quests = await db.get_user_quests(user.id)
         if not quests:
             await callback.message.edit_text("📋 У тебя пока нет активных квестов!")
         else:
             keyboard = []
-            now = datetime.now()
             for q in quests:
                 q_id = q[0]
                 q_title = q[2]
                 q_type = q[3]
-                q_deadline = q[7]
                 status_emoji = "⚪"
-                if q_deadline:
-                    try:
-                        d = datetime.strptime(q_deadline, "%Y-%m-%d %H:%M:%S")
-                        if d.hour == 0 and d.minute == 0:
-                            d = d.replace(hour=23, minute=0)
-                        if now > d:
-                            status_emoji = "🔴"
-                        else:
-                            if (d - now).total_seconds() <= 3600:
-                                status_emoji = "🟡"
-                    except Exception:
-                        pass
                 type_emoji = {"physical": "💪", "intellectual": "📚", "mental": "🧠", "custom": "🎯"}.get(q_type, "🎯")
                 keyboard.append([InlineKeyboardButton(text=f"{status_emoji} {type_emoji} {q_title}", callback_data=f"quest_{q_id}")])
             await callback.message.edit_text("📋 Выбери квест:", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
@@ -613,14 +534,13 @@ async def process_quest_comment(message: Message, state: FSMContext):
     """Обработка комментария (текст) и создание квеста"""
     text = message.text.strip()
     data = await state.get_data()
-    deadline_in_state = data.get("deadline")
-    comment = text if comment_should_be_saved(text, deadline_in_state) else None
+    comment = text if comment_should_be_saved(text, None) else None
     if comment:
         is_valid, error_msg = db.validate_input(comment, "Комментарий")
         if not is_valid:
             await message.answer(f"❌ {error_msg}")
             return
-    logger.info(f"[CREATE] comment by {message.from_user.id} -> raw='{text}', saved='{comment}', deadline_in_state='{deadline_in_state}'")
+    logger.info(f"[CREATE] comment by {message.from_user.id} -> raw='{text}', saved='{comment}'")
     # Гарантируем, что пользователь существует в БД
     await db.add_user(message.from_user.id, message.from_user.first_name or message.from_user.username or "User")
 
@@ -629,10 +549,10 @@ async def process_quest_comment(message: Message, state: FSMContext):
         title=data["title"],
         quest_type=data["quest_type"],
         target_value=data["target_value"],
-        deadline=data.get("deadline"),
-        comment=comment
+        comment=comment,
+        deadline=None
     )
-    logger.info(f"[CREATE] create_quest requested by {message.from_user.id} -> title='{data.get('title')}', type='{data.get('quest_type')}', target='{data.get('target_value')}', deadline='{data.get('deadline')}', comment='{comment}', result_id='{quest_id}', error='{error}'")
+    logger.info(f"[CREATE] create_quest requested by {message.from_user.id} -> title='{data.get('title')}', type='{data.get('quest_type')}', target='{data.get('target_value')}', comment='{comment}', result_id='{quest_id}', error='{error}'")
     
     if error:
         await state.clear()
@@ -642,8 +562,6 @@ async def process_quest_comment(message: Message, state: FSMContext):
         )
         return
     else:
-        if data.get("quest_type") == "custom" and data.get("custom_initial_done") and quest_id:
-            await db.update_quest_progress(message.from_user.id, quest_id, 1)
         await state.clear()
         # Показать список квестов (inline)
         user_id = message.from_user.id
@@ -652,27 +570,13 @@ async def process_quest_comment(message: Message, state: FSMContext):
             await message.answer("📋 У тебя пока нет активных квестов!")
         else:
             keyboard = []
-            now = datetime.now()
-            for q in quests:
-                q_id = q[0]
-                q_title = q[2]
-                q_type = q[3]
-                q_deadline = q[7]
+            for quest in quests:
+                quest_id = quest[0]
+                title = quest[2]
+                quest_type = quest[3]
                 status_emoji = "⚪"
-                if q_deadline:
-                    try:
-                        d = datetime.strptime(q_deadline, "%Y-%m-%d %H:%M:%S")
-                        if d.hour == 0 and d.minute == 0:
-                            d = d.replace(hour=23, minute=0)
-                        if now > d:
-                            status_emoji = "🔴"
-                        else:
-                            if (d - now).total_seconds() <= 3600:
-                                status_emoji = "🟡"
-                    except Exception:
-                        pass
-                type_emoji = {"physical": "💪", "intellectual": "📚", "mental": "🧠", "custom": "🎯"}.get(q_type, "🎯")
-                keyboard.append([InlineKeyboardButton(text=f"{status_emoji} {type_emoji} {q_title}", callback_data=f"quest_{q_id}")])
+                type_emoji = {"physical": "💪", "intellectual": "📚", "mental": "🧠", "custom": "🎯"}.get(quest_type, "🎯")
+                keyboard.append([InlineKeyboardButton(text=f"{status_emoji} {type_emoji} {title}", callback_data=f"quest_{quest_id}")])
             await message.answer("📋 Выбери квест:", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
 
 
@@ -685,25 +589,11 @@ async def show_my_quests(message: Message):
         await message.answer("📋 У тебя пока нет активных квестов!")
         return
     keyboard = []
-    now = datetime.now()
     for quest in quests:
         quest_id = quest[0]
         title = quest[2]
         quest_type = quest[3]
-        deadline = quest[7]
         status_emoji = "⚪"
-        if deadline:
-            try:
-                d = datetime.strptime(deadline, "%Y-%m-%d %H:%M:%S")
-                if d.hour == 0 and d.minute == 0:
-                    d = d.replace(hour=23, minute=0)
-                if now > d:
-                    status_emoji = "🔴"
-                else:
-                    if (d - now).total_seconds() <= 3600:
-                        status_emoji = "🟡"
-            except Exception:
-                pass
         type_emoji = {"physical": "💪", "intellectual": "📚", "mental": "🧠", "custom": "🎯"}.get(quest_type, "🎯")
         keyboard.append([InlineKeyboardButton(text=f"{status_emoji} {type_emoji} {title}", callback_data=f"quest_{quest_id}")])
     await message.answer("📋 Выбери квест:", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
@@ -723,25 +613,11 @@ async def cb_my_quests(callback: CallbackQuery):
         await callback.answer()
         return
     keyboard = []
-    now = datetime.now()
     for quest in quests:
         quest_id = quest[0]
         title = quest[2]
         quest_type = quest[3]
-        deadline = quest[7]
         status_emoji = "⚪"
-        if deadline:
-            try:
-                d = datetime.strptime(deadline, "%Y-%m-%d %H:%M:%S")
-                if d.hour == 0 and d.minute == 0:
-                    d = d.replace(hour=23, minute=0)
-                if now > d:
-                    status_emoji = "🔴"
-                else:
-                    if (d - now).total_seconds() <= 3600:
-                        status_emoji = "🟡"
-            except Exception:
-                pass
         type_emoji = {"physical": "💪", "intellectual": "📚", "mental": "🧠", "custom": "🎯"}.get(quest_type, "🎯")
         keyboard.append([InlineKeyboardButton(text=f"{status_emoji} {type_emoji} {title}", callback_data=f"quest_{quest_id}")])
     await callback.message.edit_text("📋 Выбери квест:", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
@@ -763,7 +639,8 @@ async def cb_quest_detail(callback: CallbackQuery):
     text = format_quest_text(quest)
     completed = bool(quest[6])
     quest_type = quest[3]
-    await callback.message.edit_text(text, reply_markup=get_quest_detail_keyboard(quest_id, completed, quest_type), parse_mode="HTML")
+    target_value = int(quest[4])
+    await callback.message.edit_text(text, reply_markup=get_quest_detail_keyboard(quest_id, completed, quest_type, target_value), parse_mode="HTML")
     await callback.answer()
 
 @router.callback_query(F.data.startswith("progress_"))
@@ -782,11 +659,14 @@ async def cb_progress(callback: CallbackQuery, state: FSMContext):
     target_value = quest[4]
     current_value = quest[5]
     await state.set_state(QuestProgress.waiting_for_value)
-    await state.update_data(progress_quest_id=quest_id, quest_type=quest_type)
+    await state.update_data(progress_quest_id=quest_id, quest_type=quest_type, target_value=target_value)
     if quest_type in ["physical", "intellectual", "mental"]:
-        text = f"Текущий прогресс: {current_value}/{target_value}\n\nВведи новое значение:"
+        text = f"Текущий прогресс: {current_value}/{target_value}\n\nВведи величину прироста (число):"
     else:
-        text = f"Текущий статус: {'выполнено' if current_value >= 1 else 'не выполнено'}\n\nОтметить как выполнено? (да/нет):"
+        if int(target_value or 0) == 0:
+            await callback.answer("Для этого квеста прогресс не доступен")
+            return
+        text = f"Текущий прогресс: {current_value}%\n\nВведи прирост в процентах (0-100):"
     keyboard = [[InlineKeyboardButton(text="❌ Отмена", callback_data=f"quest_{quest_id}")]]
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
     await callback.answer()
@@ -796,18 +676,50 @@ async def process_progress_value(message: Message, state: FSMContext):
     data = await state.get_data()
     quest_id = data.get("progress_quest_id")
     quest_type = data.get("quest_type")
+    target_value = int(data.get("target_value") or 0)
     if quest_type == "custom":
-        text = message.text.strip().lower()
-        new_value = 1 if text in ["да", "yes", "+", "y"] else 0
+        if target_value == 0:
+            await message.answer("❌ У этого квеста нет шкалы прогресса", reply_markup=get_quests_menu_keyboard())
+            await state.clear()
+            return
+        if not message.text.isdigit():
+            await message.answer("❌ Введи число 0-100")
+            return
+        delta = int(message.text)
+        if delta < 0 or delta > 100:
+            await message.answer("❌ Укажи значение от 0 до 100")
+            return
+        # Миграция старых кастомных квестов (target_value=1) -> шкала 0..100
+        if target_value < 100:
+            try:
+                await db.update_quest(message.from_user.id, quest_id, target_value=100)
+            except Exception:
+                pass
+        # Получим текущее значение и посчитаем сумму
+        quest = await db.get_quest(message.from_user.id, quest_id)
+        if not quest:
+            await state.clear()
+            await message.answer("❌ Квест не найден", reply_markup=get_quests_menu_keyboard())
+            return
+        current = int(quest[5] or 0)
+        new_value = min(100, current + delta)
     else:
         if not message.text.isdigit():
             await message.answer("❌ Введи число")
             return
-        new_value = int(message.text)
-        # Для percent-типов больше не используется, но на всякий случай ограничим отрицательные числа
-        if new_value < 0:
+        delta = int(message.text)
+        if delta < 0:
             await message.answer("❌ Значение не может быть отрицательным")
             return
+        # Получим квест, чтобы знать текущий прогресс и цель
+        quest = await db.get_quest(message.from_user.id, quest_id)
+        if not quest:
+            await state.clear()
+            await message.answer("❌ Квест не найден", reply_markup=get_quests_menu_keyboard())
+            return
+        current = int(quest[5] or 0)
+        target = int(quest[4] or 0)
+        new_value = min(target, current + delta)
     quest = await db.update_quest_progress(message.from_user.id, quest_id, new_value)
     await state.clear()
     if quest:
@@ -830,6 +742,36 @@ async def cb_complete(callback: CallbackQuery):
     else:
         await callback.answer("Ошибка завершения")
 
+
+@router.callback_query(F.data.startswith("delete_"))
+async def cb_delete_quest(callback: CallbackQuery):
+    try:
+        quest_id = int(callback.data.split("_")[1])
+    except Exception:
+        await callback.answer("Ошибка ID")
+        return
+    user_id = callback.from_user.id
+    ok = await db.delete_quest(user_id, quest_id)
+    if ok:
+        await callback.answer("🗑 Удалено")
+        # Обновляем список квестов
+        quests = await db.get_user_quests(user_id)
+        if not quests:
+            keyboard = [[InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_menu")]]
+            await callback.message.edit_text("📋 У тебя пока нет активных квестов!", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+        else:
+            keyboard = []
+            for quest in quests:
+                q_id = quest[0]
+                title = quest[2]
+                q_type = quest[3]
+                status_emoji = "⚪"
+                type_emoji = {"physical": "💪", "intellectual": "📚", "mental": "🧠", "custom": "🎯"}.get(q_type, "🎯")
+                keyboard.append([InlineKeyboardButton(text=f"{status_emoji} {type_emoji} {title}", callback_data=f"quest_{q_id}")])
+            await callback.message.edit_text("📋 Выбери квест:", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+    else:
+        await callback.answer("Ошибка удаления")
+
 @router.callback_query(F.data.startswith("edit_"))
 async def cb_edit_menu(callback: CallbackQuery):
     try:
@@ -840,7 +782,6 @@ async def cb_edit_menu(callback: CallbackQuery):
     keyboard = [
         [InlineKeyboardButton(text="📝 Название", callback_data=f"edit_title_{quest_id}")],
         [InlineKeyboardButton(text="🎯 Цель", callback_data=f"edit_target_{quest_id}")],
-        [InlineKeyboardButton(text="📅 Дедлайн", callback_data=f"edit_deadline_{quest_id}")],
         [InlineKeyboardButton(text="💬 Комментарий", callback_data=f"edit_comment_{quest_id}")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data=f"quest_{quest_id}")],
     ]
@@ -899,41 +840,7 @@ async def process_edit_target(message: Message, state: FSMContext):
     else:
         await message.answer("✅ Цель обновлена", reply_markup=get_quests_menu_keyboard())
 
-@router.callback_query(F.data.startswith("edit_deadline_"))
-async def cb_edit_deadline(callback: CallbackQuery, state: FSMContext):
-    quest_id = int(callback.data.split("_")[2])
-    await state.set_state(QuestEdit.waiting_for_deadline)
-    await state.update_data(edit_quest_id=quest_id)
-    keyboard = [[InlineKeyboardButton(text="❌ Отмена", callback_data=f"quest_{quest_id}")]]
-    await callback.message.edit_text("Введи новый дедлайн (ДД.ММ.ГГ или ДД.ММ.ГГ ЧЧ:ММ) или 'нет':", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
-    await callback.answer()
-
-@router.message(QuestEdit.waiting_for_deadline)
-async def process_edit_deadline(message: Message, state: FSMContext):
-    text = message.text.strip()
-    deadline = None
-    if text.lower() not in ["нет", "no", "skip"]:
-        try:
-            text_normalized = text.replace('/', '.').replace('-', '.')
-            if ' ' in text_normalized and ':' in text_normalized:
-                deadline_date = datetime.strptime(text_normalized, "%d.%m.%y %H:%M")
-            else:
-                deadline_date = datetime.strptime(text_normalized, "%d.%m.%y")
-            if deadline_date < datetime.now():
-                await message.answer("❌ Нельзя установить прошедшую дату!")
-                return
-            deadline = deadline_date.strftime("%Y-%m-%d %H:%M:%S")
-        except ValueError:
-            await message.answer("❌ Неверный формат даты!")
-            return
-    data = await state.get_data()
-    quest_id = data.get("edit_quest_id")
-    _, error = await db.update_quest(message.from_user.id, quest_id, deadline=deadline)
-    await state.clear()
-    if error:
-        await message.answer(f"❌ {error}", reply_markup=get_quests_menu_keyboard())
-    else:
-        await message.answer("✅ Дедлайн обновлён", reply_markup=get_quests_menu_keyboard())
+## Редактирование дедлайна удалено
 
 @router.callback_query(F.data.startswith("edit_comment_"))
 async def cb_edit_comment(callback: CallbackQuery, state: FSMContext):
@@ -1109,13 +1016,91 @@ async def callback_meditate(callback: CallbackQuery):
         return
     minutes = int(quest[4])
     await callback.answer("Таймер запущен")
-    await callback.message.answer(f"🧘 Медитация начата на {minutes} мин.")
-    async def _timer(chat_id: int, mins: int):
-        from asyncio import sleep
-        await sleep(mins * 60)
-        await callback.message.bot.send_message(chat_id, "⏰ Время медитации вышло! Как самочувствие?")
+    # Сообщение с кнопкой отмены медитации
+    cancel_kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data=f"cancel_meditation_{quest_id}")]]
+    )
+    await callback.message.answer(f"🧘 Медитация начата на {minutes} мин.", reply_markup=cancel_kb)
+    # Запускаем таймер и сохраняем сессию
     try:
         import asyncio
-        asyncio.create_task(_timer(callback.message.chat.id, minutes))
+        start_time = datetime.now()
+        async def _timer(chat_id: int, mins: int, u_id: int, q_id: int):
+            from asyncio import sleep
+            await sleep(mins * 60)
+            # Убираем сессию, если есть
+            MEDITATION_SESSIONS.pop((u_id, q_id), None)
+            # Завершаем квест автоматически
+            try:
+                await db.complete_quest(u_id, q_id)
+            except Exception:
+                pass
+            # Сообщение и возврат к списку квестов
+            await callback.message.bot.send_message(chat_id, "медитация завершена")
+            # Показать список квестов (inline)
+            quests = await db.get_user_quests(u_id)
+            keyboard = []
+            for q in quests:
+                q_id2 = q[0]
+                title2 = q[2]
+                q_type2 = q[3]
+                status_emoji = "⚪"
+                type_emoji = {"physical": "💪", "intellectual": "📚", "mental": "🧠", "custom": "🎯"}.get(q_type2, "🎯")
+                keyboard.append([InlineKeyboardButton(text=f"{status_emoji} {type_emoji} {title2}", callback_data=f"quest_{q_id2}")])
+            await callback.message.bot.send_message(chat_id, "📋 Выбери квест:", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+
+        task = asyncio.create_task(_timer(callback.message.chat.id, minutes, user_id, quest_id))
+        MEDITATION_SESSIONS[(user_id, quest_id)] = {"start": start_time, "task": task}
     except Exception:
         pass
+
+@router.callback_query(F.data.startswith("cancel_meditation_"))
+async def cancel_meditation(callback: CallbackQuery):
+    try:
+        quest_id = int(callback.data.split("_")[2])
+    except Exception:
+        await callback.answer("Ошибка ID")
+        return
+    user_id = callback.from_user.id
+    sess = MEDITATION_SESSIONS.pop((user_id, quest_id), None)
+    elapsed_minutes = 0
+    if sess:
+        try:
+            task = sess.get("task")
+            if task:
+                task.cancel()
+        except Exception:
+            pass
+        try:
+            start = sess.get("start")
+            if isinstance(start, datetime):
+                elapsed_minutes = int(max(0, (datetime.now() - start).total_seconds() // 60))
+        except Exception:
+            elapsed_minutes = 0
+    # Обновим прогресс медитации прошедшими минутами, не превышая цель
+    quest = await db.get_quest(user_id, quest_id)
+    if quest:
+        target_minutes = int(quest[4])
+        new_value = min(elapsed_minutes, target_minutes)
+        try:
+            await db.update_quest_progress(user_id, quest_id, new_value)
+        except Exception:
+            pass
+    await callback.answer("медитация прервана")
+    # Вернёмся на форму квеста
+    quest = await db.get_quest(user_id, quest_id)
+    if quest:
+        text = format_quest_text(quest)
+        completed = bool(quest[6])
+        quest_type = quest[3]
+        target_value = int(quest[4])
+        await callback.message.edit_text(text, reply_markup=get_quest_detail_keyboard(quest_id, completed, quest_type, target_value), parse_mode="HTML")
+        # Низовое меню доступно через стандартное reply-меню уже имеющееся у пользователя
+
+@router.message(F.text.casefold() == "отмена")
+async def cancel_creation(message: Message, state: FSMContext):
+    cur = await state.get_state()
+    # Отмена работает только в процессе создания
+    if cur and cur.startswith(QuestCreation.__name__):
+        await state.clear()
+        await message.answer("📋 Квесты\n\nВыбери действие:", reply_markup=get_quests_menu_keyboard())

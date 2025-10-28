@@ -34,6 +34,8 @@ class Config:
         "mental": "🧠 Ментальная задача",
         "custom": "🎯 Произвольный квест"
     }
+    # Timezone offset in minutes relative to UTC for user-local computations
+    TZ_OFFSET_MINUTES: int = int(os.getenv('TZ_OFFSET_MINUTES', '0'))
     
     @classmethod
     def validate(cls) -> bool:
