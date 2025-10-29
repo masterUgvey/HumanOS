@@ -32,7 +32,9 @@ class Database:
                 CREATE TABLE IF NOT EXISTS users (
                     user_id INTEGER PRIMARY KEY,
                     username TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    tz_offset_minutes INTEGER,
+                    tz_prompted BOOLEAN DEFAULT FALSE
                 )
             ''')
 
@@ -55,6 +57,8 @@ class Database:
                         deadline TIMESTAMP,
                         comment TEXT,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        has_date BOOLEAN DEFAULT FALSE,
+                        has_time BOOLEAN DEFAULT FALSE,
                         FOREIGN KEY (user_id) REFERENCES users (user_id)
                     )
                 ''')
@@ -69,6 +73,10 @@ class Database:
                     migrations.append("ALTER TABLE quests ADD COLUMN deadline TIMESTAMP")
                 if 'comment' not in existing_columns:
                     migrations.append("ALTER TABLE quests ADD COLUMN comment TEXT")
+                if 'has_date' not in existing_columns:
+                    migrations.append("ALTER TABLE quests ADD COLUMN has_date BOOLEAN DEFAULT FALSE")
+                if 'has_time' not in existing_columns:
+                    migrations.append("ALTER TABLE quests ADD COLUMN has_time BOOLEAN DEFAULT FALSE")
 
                 for sql in migrations:
                     try:
@@ -82,8 +90,25 @@ class Database:
                     try:
                         await db.execute("UPDATE quests SET current_value = COALESCE(current_value, 0)")
                         await db.execute("UPDATE quests SET completed = COALESCE(completed, FALSE)")
+                        # Инициализируем флаги дат/времени на основе существующего дедлайна
+                        await db.execute("UPDATE quests SET has_date = CASE WHEN deadline IS NOT NULL THEN TRUE ELSE FALSE END WHERE has_date IS NULL OR has_date = FALSE")
+                        await db.execute("UPDATE quests SET has_time = CASE WHEN deadline IS NOT NULL AND TIME(deadline) != '00:00:00' THEN TRUE ELSE FALSE END WHERE has_time IS NULL OR has_time = FALSE")
                     except Exception as e:
                         logger.warning(f"⚠️ Ошибка установки значений по умолчанию: {e}")
+
+            # Миграции для таблицы users
+            try:
+                cursor_u = await db.execute("PRAGMA table_info('users')")
+                cols_u_info = await cursor_u.fetchall()
+                cols_u = {row[1] for row in cols_u_info}
+                if 'tz_offset_minutes' not in cols_u:
+                    await db.execute("ALTER TABLE users ADD COLUMN tz_offset_minutes INTEGER")
+                if 'tz_prompted' not in cols_u:
+                    await db.execute("ALTER TABLE users ADD COLUMN tz_prompted BOOLEAN DEFAULT FALSE")
+                if 'log_subscribed' not in cols_u:
+                    await db.execute("ALTER TABLE users ADD COLUMN log_subscribed BOOLEAN DEFAULT FALSE")
+            except Exception as e:
+                logger.warning(f"⚠️ Ошибка миграции users: {e}")
 
             await db.commit()
             logger.info("✅ База данных инициализирована")
@@ -134,6 +159,38 @@ class Database:
             )
             await db.commit()
             logger.debug(f"👤 Пользователь {username} (ID: {user_id}) добавлен/обновлен")
+
+    async def get_user_timezone(self, user_id: int) -> Tuple[Optional[int], bool]:
+        """Получить смещение таймзоны и признак, что пользователя уже спрашивали"""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute('SELECT tz_offset_minutes, COALESCE(tz_prompted, FALSE) FROM users WHERE user_id = ?', (user_id,))
+            row = await cursor.fetchone()
+            if not row:
+                return None, False
+            return row[0], bool(row[1])
+
+    async def set_user_timezone(self, user_id: int, offset_minutes: int) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute('UPDATE users SET tz_offset_minutes = ?, tz_prompted = TRUE WHERE user_id = ?', (offset_minutes, user_id))
+            await db.commit()
+
+    async def set_user_tz_prompted(self, user_id: int) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute('UPDATE users SET tz_prompted = TRUE WHERE user_id = ?', (user_id,))
+            await db.commit()
+
+    async def set_log_subscription(self, user_id: int, subscribed: bool) -> None:
+        """Включить/выключить подписку на RT-логи для пользователя"""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute('UPDATE users SET log_subscribed = ? WHERE user_id = ?', (int(bool(subscribed)), user_id))
+            await db.commit()
+
+    async def get_log_subscribers(self) -> List[int]:
+        """Получить user_id всех подписчиков логов"""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute('SELECT user_id FROM users WHERE COALESCE(log_subscribed, FALSE) = TRUE')
+            rows = await cursor.fetchall()
+            return [r[0] for r in rows]
     
     async def create_quest(
         self,
@@ -142,7 +199,9 @@ class Database:
         quest_type: str,
         target_value: int,
         deadline: Optional[str] = None,
-        comment: Optional[str] = None
+        comment: Optional[str] = None,
+        has_date: Optional[bool] = None,
+        has_time: Optional[bool] = None
     ) -> Tuple[Optional[int], Optional[str]]:
         """
         Создание нового квеста с валидацией
@@ -178,6 +237,31 @@ class Database:
                 d_str = str(deadline).strip()
                 if re.fullmatch(r"\d{4}-\d{2}-\d{2}$", d_str):
                     deadline = f"{d_str} 00:00:00"
+            # Вычислим флаги has_date/has_time, если не переданы
+            if has_date is None or has_time is None:
+                if deadline is None:
+                    has_date = False if has_date is None else has_date
+                    has_time = False if has_time is None else has_time
+                else:
+                    # deadline c временем или без
+                    try:
+                        tpart = str(deadline).strip().split(" ")[1] if " " in str(deadline).strip() else "00:00:00"
+                    except Exception:
+                        tpart = "00:00:00"
+                    if has_date is None:
+                        has_date = True
+                    if has_time is None:
+                        has_time = (tpart != "00:00:00")
+            # Если флаги явно указаны и противоречат deadline, синхронизируем:
+            if not has_date:
+                deadline = None
+            elif has_date and not has_time and deadline:
+                # Принудительно обнуляем время, если передано
+                try:
+                    d = datetime.strptime(deadline, "%Y-%m-%d %H:%M:%S")
+                    deadline = f"{d.strftime('%Y-%m-%d')} 00:00:00"
+                except Exception:
+                    pass
             # Не сохраняем комментарий, если он пустой или выглядит как дата/дата-время
             if comment is not None:
                 c = str(comment).strip()
@@ -193,12 +277,12 @@ class Database:
                     ]
                     if any(re.fullmatch(p, c) for p in date_like) or (deadline and c == str(deadline)):
                         comment = None
-            logger.info(f"[DB] create_quest normalized -> user_id={user_id}, title='{title}', type='{quest_type}', target={target_value}, deadline='{deadline}', comment='{comment}'")
+            logger.info(f"[DB] create_quest normalized -> user_id={user_id}, title='{title}', type='{quest_type}', target={target_value}, deadline='{deadline}', comment='{comment}', has_date={has_date}, has_time={has_time}")
             async with aiosqlite.connect(self.db_path) as db:
                 cursor = await db.execute(
-                    '''INSERT INTO quests (user_id, title, quest_type, target_value, deadline, comment) 
-                       VALUES (?, ?, ?, ?, ?, ?)''',
-                    (user_id, title, quest_type, target_value, deadline, comment)
+                    '''INSERT INTO quests (user_id, title, quest_type, target_value, deadline, comment, has_date, has_time) 
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                    (user_id, title, quest_type, target_value, deadline, comment, int(bool(has_date)), int(bool(has_time)))
                 )
                 quest_id = cursor.lastrowid
                 await db.commit()
@@ -220,7 +304,8 @@ class Database:
         """
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
-                'SELECT * FROM quests WHERE user_id = ? AND completed = FALSE ORDER BY created_at DESC',
+                'SELECT quest_id, user_id, title, quest_type, target_value, current_value, completed, deadline, comment, created_at, has_date, has_time '
+                'FROM quests WHERE user_id = ? AND completed = FALSE ORDER BY created_at DESC',
                 (user_id,)
             )
             quests = await cursor.fetchall()
@@ -296,7 +381,8 @@ class Database:
         """
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
-                'SELECT * FROM quests WHERE quest_id = ? AND user_id = ?',
+                'SELECT quest_id, user_id, title, quest_type, target_value, current_value, completed, deadline, comment, created_at, has_date, has_time '
+                'FROM quests WHERE quest_id = ? AND user_id = ?',
                 (quest_id, user_id)
             )
             quest = await cursor.fetchone()
@@ -378,7 +464,8 @@ class Database:
             await db.commit()
             
             cursor = await db.execute(
-                'SELECT * FROM quests WHERE quest_id = ? AND user_id = ?',
+                'SELECT quest_id, user_id, title, quest_type, target_value, current_value, completed, deadline, comment, created_at, has_date, has_time '
+                'FROM quests WHERE quest_id = ? AND user_id = ?',
                 (quest_id, user_id)
             )
             quest = await cursor.fetchone()
@@ -502,7 +589,8 @@ class Database:
                 await db.commit()
                 
                 cursor = await db.execute(
-                    'SELECT * FROM quests WHERE quest_id = ? AND user_id = ?',
+                    'SELECT quest_id, user_id, title, quest_type, target_value, current_value, completed, deadline, comment, created_at, has_date, has_time '
+                    'FROM quests WHERE quest_id = ? AND user_id = ?',
                     (quest_id, user_id)
                 )
                 quest = await cursor.fetchone()
@@ -521,7 +609,8 @@ class Database:
         """
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
-                'SELECT * FROM quests WHERE deadline IS NOT NULL AND completed = FALSE'
+                'SELECT quest_id, user_id, title, quest_type, target_value, current_value, completed, deadline, comment, created_at, has_date, has_time '
+                'FROM quests WHERE deadline IS NOT NULL AND completed = FALSE'
             )
             quests = await cursor.fetchall()
             return quests
