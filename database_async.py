@@ -499,9 +499,12 @@ class Database:
         user_id: int,
         quest_id: int,
         title: Optional[str] = None,
+        quest_type: Optional[str] = None,
         target_value: Optional[int] = None,
         deadline: Optional[str] = None,
-        comment: Optional[str] = None
+        comment: Optional[str] = None,
+        has_date: Optional[bool] = None,
+        has_time: Optional[bool] = None
     ) -> Tuple[Optional[tuple], Optional[str]]:
         """
         Обновление параметров квеста с валидацией
@@ -529,12 +532,21 @@ class Database:
             if not is_valid:
                 return None, error_msg
         
+        # Валидация типа квеста
+        if quest_type is not None:
+            allowed_types = set(config.QUEST_TYPES.keys())
+            if quest_type not in allowed_types:
+                return None, "Некорректный тип квеста"
+        
         updates = []
         params = []
         
         if title is not None:
             updates.append('title = ?')
             params.append(title)
+        if quest_type is not None:
+            updates.append('quest_type = ?')
+            params.append(quest_type)
         if target_value is not None:
             updates.append('target_value = ?')
             params.append(target_value)
@@ -545,7 +557,7 @@ class Database:
                 if dstr == "":
                     updates.append('deadline = NULL')
                 else:
-                    # Если только дата, приводим к 'YYYY-MM-DD 00:00:00'
+                    # Если только дата, приводим к 'YYYY-MM-DD 00:00:00' (если это не нужно — передавайте полную строку)
                     if re.fullmatch(r"\d{4}-\d{2}-\d{2}$", dstr):
                         dstr = f"{dstr} 00:00:00"
                     updates.append('deadline = ?')
@@ -575,6 +587,13 @@ class Database:
             else:
                 updates.append('comment = ?')
                 params.append(comment)
+        # Флаги has_date / has_time, если переданы явно
+        if has_date is not None:
+            updates.append('has_date = ?')
+            params.append(int(bool(has_date)))
+        if has_time is not None:
+            updates.append('has_time = ?')
+            params.append(int(bool(has_time)))
         logger.info(f"[DB] update_quest -> quest_id={quest_id}, user_id={user_id}, updates={updates}, params={params}")
         
         if not updates:
