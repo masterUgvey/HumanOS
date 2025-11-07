@@ -77,6 +77,17 @@ class Database:
                     migrations.append("ALTER TABLE quests ADD COLUMN has_date BOOLEAN DEFAULT FALSE")
                 if 'has_time' not in existing_columns:
                     migrations.append("ALTER TABLE quests ADD COLUMN has_time BOOLEAN DEFAULT FALSE")
+                # Daily tasks расширения
+                if 'is_daily' not in existing_columns:
+                    migrations.append("ALTER TABLE quests ADD COLUMN is_daily BOOLEAN DEFAULT FALSE")
+                if 'repeat_days' not in existing_columns:
+                    migrations.append("ALTER TABLE quests ADD COLUMN repeat_days TEXT")
+                if 'streak' not in existing_columns:
+                    migrations.append("ALTER TABLE quests ADD COLUMN streak INTEGER DEFAULT 0")
+                if 'last_done_date' not in existing_columns:
+                    migrations.append("ALTER TABLE quests ADD COLUMN last_done_date TEXT")
+                if 'daily_reminder_time' not in existing_columns:
+                    migrations.append("ALTER TABLE quests ADD COLUMN daily_reminder_time TEXT")
 
                 for sql in migrations:
                     try:
@@ -93,6 +104,9 @@ class Database:
                         # Инициализируем флаги дат/времени на основе существующего дедлайна
                         await db.execute("UPDATE quests SET has_date = CASE WHEN deadline IS NOT NULL THEN TRUE ELSE FALSE END WHERE has_date IS NULL OR has_date = FALSE")
                         await db.execute("UPDATE quests SET has_time = CASE WHEN deadline IS NOT NULL AND TIME(deadline) != '00:00:00' THEN TRUE ELSE FALSE END WHERE has_time IS NULL OR has_time = FALSE")
+                        # Дефолты для daily
+                        await db.execute("UPDATE quests SET streak = COALESCE(streak, 0)")
+                        await db.execute("UPDATE quests SET is_daily = COALESCE(is_daily, FALSE)")
                     except Exception as e:
                         logger.warning(f"⚠️ Ошибка установки значений по умолчанию: {e}")
 
@@ -109,6 +123,68 @@ class Database:
                     await db.execute("ALTER TABLE users ADD COLUMN log_subscribed BOOLEAN DEFAULT FALSE")
             except Exception as e:
                 logger.warning(f"⚠️ Ошибка миграции users: {e}")
+
+            # Таблица списков (lists)
+            try:
+                await db.execute('''
+                    CREATE TABLE IF NOT EXISTS lists (
+                        list_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER,
+                        title TEXT NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        is_template BOOLEAN DEFAULT FALSE,
+                        FOREIGN KEY (user_id) REFERENCES users (user_id)
+                    )
+                ''')
+            except Exception as e:
+                logger.error(f"❌ Ошибка создания таблицы lists: {e}")
+
+            # Таблица элементов списков (list_items)
+            try:
+                await db.execute('''
+                    CREATE TABLE IF NOT EXISTS list_items (
+                        item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        list_id INTEGER NOT NULL,
+                        text TEXT NOT NULL,
+                        completed BOOLEAN DEFAULT FALSE,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (list_id) REFERENCES lists (list_id) ON DELETE CASCADE
+                    )
+                ''')
+            except Exception as e:
+                logger.error(f"❌ Ошибка создания таблицы list_items: {e}")
+
+            # Лёгкие миграции для lists
+            try:
+                cur = await db.execute("PRAGMA table_info('lists')")
+                cols = {row[1] for row in await cur.fetchall()}
+                migrations = []
+                if 'is_template' not in cols:
+                    migrations.append("ALTER TABLE lists ADD COLUMN is_template BOOLEAN DEFAULT FALSE")
+                for sql in migrations:
+                    try:
+                        await db.execute(sql)
+                        logger.info(f"🧩 Применена миграция (lists): {sql}")
+                    except Exception as e:
+                        logger.warning(f"⚠️ Ошибка миграции lists '{sql}': {e}")
+            except Exception as e:
+                logger.warning(f"⚠️ Ошибка проверки схемы lists: {e}")
+
+            # Лёгкие миграции для list_items
+            try:
+                cur = await db.execute("PRAGMA table_info('list_items')")
+                cols = {row[1] for row in await cur.fetchall()}
+                migrations = []
+                if 'completed' not in cols:
+                    migrations.append("ALTER TABLE list_items ADD COLUMN completed BOOLEAN DEFAULT FALSE")
+                for sql in migrations:
+                    try:
+                        await db.execute(sql)
+                        logger.info(f"🧩 Применена миграция (list_items): {sql}")
+                    except Exception as e:
+                        logger.warning(f"⚠️ Ошибка миграции list_items '{sql}': {e}")
+            except Exception as e:
+                logger.warning(f"⚠️ Ошибка проверки схемы list_items: {e}")
 
             await db.commit()
             logger.info("✅ База данных инициализирована")
@@ -633,6 +709,249 @@ class Database:
             )
             quests = await cursor.fetchall()
             return quests
+
+    # ===== Daily tasks helpers =====
+    async def get_user_daily_quests(self, user_id: int) -> List[tuple]:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                'SELECT quest_id, user_id, title, quest_type, target_value, current_value, completed, deadline, comment, created_at, has_date, has_time, is_daily, repeat_days, streak, last_done_date, daily_reminder_time '
+                'FROM quests WHERE user_id = ? AND COALESCE(is_daily, FALSE) = TRUE ORDER BY created_at DESC',
+                (user_id,)
+            )
+            return await cur.fetchall()
+
+    def _parse_repeat_days(self, repeat_days: str | None) -> List[int]:
+        try:
+            if not repeat_days:
+                return []
+            days = []
+            for part in str(repeat_days).split(','):
+                p = part.strip()
+                if p == '':
+                    continue
+                v = int(p)
+                if 0 <= v <= 6 or 1 <= v <= 7:
+                    days.append(v)
+            return days
+        except Exception:
+            return []
+
+    async def _today_local_date(self, user_id: int) -> str:
+        try:
+            tz_off, _ = await self.get_user_timezone(user_id)
+            now_utc = datetime.utcnow()
+            if tz_off is None:
+                dt_local = now_utc
+            else:
+                dt_local = now_utc + timedelta(minutes=int(tz_off))
+            return dt_local.strftime('%Y-%m-%d')
+        except Exception:
+            return datetime.utcnow().strftime('%Y-%m-%d')
+
+    async def is_done_today(self, user_id: int, quest_id: int) -> bool:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute('SELECT last_done_date FROM quests WHERE quest_id = ? AND user_id = ? AND COALESCE(is_daily, FALSE) = TRUE', (quest_id, user_id))
+            row = await cur.fetchone()
+            if not row:
+                return False
+            last_done = row[0]
+            today = await self._today_local_date(user_id)
+            return bool(last_done) and str(last_done) == today
+
+    async def mark_daily_done_for_today(self, user_id: int, quest_id: int) -> bool:
+        async with aiosqlite.connect(self.db_path) as con:
+            # Получим предыдущую дату и последовательность
+            cur = await con.execute('SELECT last_done_date, streak, repeat_days FROM quests WHERE quest_id = ? AND user_id = ? AND COALESCE(is_daily, FALSE) = TRUE', (quest_id, user_id))
+            row = await cur.fetchone()
+            if not row:
+                return False
+            prev_date, streak, repeat_days = row[0], int(row[1] or 0), row[2]
+            today = await self._today_local_date(user_id)
+            # Если уже выполнено сегодня — ничего не делаем
+            if prev_date == today:
+                return True
+            # Проверка непрерывности: вчерашняя дата
+            try:
+                dt_today = datetime.strptime(today, '%Y-%m-%d')
+                dt_prev = datetime.strptime(prev_date, '%Y-%m-%d') if prev_date else None
+            except Exception:
+                dt_today, dt_prev = datetime.utcnow(), None
+            new_streak = 1
+            if dt_prev is not None:
+                delta_days = (dt_today - dt_prev).days
+                if delta_days == 1:
+                    new_streak = streak + 1
+                else:
+                    new_streak = 1
+            await con.execute('UPDATE quests SET last_done_date = ?, streak = ? WHERE quest_id = ? AND user_id = ?', (today, new_streak, quest_id, user_id))
+            await con.commit()
+            return True
+
+    async def undo_daily_for_today(self, user_id: int, quest_id: int) -> bool:
+        async with aiosqlite.connect(self.db_path) as con:
+            cur = await con.execute('SELECT last_done_date, streak FROM quests WHERE quest_id = ? AND user_id = ? AND COALESCE(is_daily, FALSE) = TRUE', (quest_id, user_id))
+            row = await cur.fetchone()
+            if not row:
+                return False
+            last_done, streak = row[0], int(row[1] or 0)
+            today = await self._today_local_date(user_id)
+            if str(last_done or '') != today:
+                return False
+            # Откатываем сегодняшнее выполнение: уменьшим streak на 1, не ниже 0, и очистим last_done_date
+            new_streak = max(0, streak - 1)
+            await con.execute('UPDATE quests SET last_done_date = NULL, streak = ? WHERE quest_id = ? AND user_id = ?', (new_streak, quest_id, user_id))
+            await con.commit()
+            return True
+
+    # ===== Lists API =====
+    async def create_list(self, user_id: int, title: str, is_template: bool = False) -> Tuple[Optional[int], Optional[str]]:
+        is_valid, error_msg = self.validate_input(title, "Название списка")
+        if not is_valid:
+            return None, error_msg
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                cur = await db.execute(
+                    'INSERT INTO lists (user_id, title, is_template) VALUES (?, ?, ?)',
+                    (user_id, title, int(bool(is_template)))
+                )
+                list_id = cur.lastrowid
+                await db.commit()
+                logger.info(f"✅ Список '{title}' создан (ID: {list_id}) для пользователя {user_id}")
+                return list_id, None
+        except Exception as e:
+            logger.error(f"❌ Ошибка создания списка: {e}")
+            return None, "Ошибка при создании списка"
+
+    async def get_user_lists(self, user_id: int) -> List[tuple]:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                'SELECT list_id, user_id, title, created_at, is_template FROM lists WHERE user_id = ? AND COALESCE(is_template, FALSE) = FALSE ORDER BY created_at DESC',
+                (user_id,)
+            )
+            return await cur.fetchall()
+
+    async def get_templates(self) -> List[tuple]:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                'SELECT list_id, user_id, title, created_at, is_template FROM lists WHERE COALESCE(is_template, FALSE) = TRUE ORDER BY created_at DESC'
+            )
+            return await cur.fetchall()
+
+    async def get_list(self, user_id: int, list_id: int) -> Optional[tuple]:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                'SELECT list_id, user_id, title, created_at, is_template FROM lists WHERE list_id = ?',
+                (list_id,)
+            )
+            row = await cur.fetchone()
+            if not row:
+                return None
+            # Разрешаем только владельцу или если это шаблон (просмотр для всех)
+            if row[1] != user_id and not bool(row[4]):
+                return None
+            return row
+
+    async def delete_list(self, user_id: int, list_id: int) -> bool:
+        async with aiosqlite.connect(self.db_path) as db:
+            # Проверим владельца
+            cur = await db.execute('SELECT user_id FROM lists WHERE list_id = ?', (list_id,))
+            owner = await cur.fetchone()
+            if not owner or owner[0] != user_id:
+                return False
+            await db.execute('DELETE FROM list_items WHERE list_id = ?', (list_id,))
+            cur = await db.execute('DELETE FROM lists WHERE list_id = ?', (list_id,))
+            await db.commit()
+            deleted = cur.rowcount > 0
+            if deleted:
+                logger.info(f"🗑️ Список {list_id} удален пользователем {user_id}")
+            return deleted
+
+    async def add_list_item(self, user_id: int, list_id: int, text: str) -> Tuple[Optional[int], Optional[str]]:
+        is_valid, error_msg = self.validate_input(text, "Элемент списка")
+        if not is_valid:
+            return None, error_msg
+        # Проверим доступ к списку
+        lst = await self.get_list(user_id, list_id)
+        if not lst or lst[1] != user_id:
+            return None, "Список не найден"
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                cur = await db.execute(
+                    'INSERT INTO list_items (list_id, text, completed) VALUES (?, ?, FALSE)',
+                    (list_id, text)
+                )
+                item_id = cur.lastrowid
+                await db.commit()
+                logger.info(f"➕ Элемент добавлен в список {list_id} (item_id={item_id})")
+                return item_id, None
+        except Exception as e:
+            logger.error(f"❌ Ошибка добавления элемента: {e}")
+            return None, "Ошибка при добавлении элемента"
+
+    async def get_list_items(self, user_id: int, list_id: int) -> List[tuple]:
+        # Проверим доступ
+        lst = await self.get_list(user_id, list_id)
+        if not lst:
+            return []
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                'SELECT item_id, list_id, text, completed, created_at FROM list_items WHERE list_id = ? ORDER BY created_at ASC',
+                (list_id,)
+            )
+            return await cur.fetchall()
+
+    async def toggle_list_item(self, user_id: int, item_id: int) -> bool:
+        async with aiosqlite.connect(self.db_path) as db:
+            # Найдем список и проверим владельца
+            cur = await db.execute('SELECT list_id, completed FROM list_items WHERE item_id = ?', (item_id,))
+            row = await cur.fetchone()
+            if not row:
+                return False
+            list_id, completed = row[0], bool(row[1])
+            cur2 = await db.execute('SELECT user_id FROM lists WHERE list_id = ?', (list_id,))
+            owner = await cur2.fetchone()
+            if not owner or owner[0] != user_id:
+                return False
+            await db.execute('UPDATE list_items SET completed = ? WHERE item_id = ?', (int(not completed), item_id))
+            await db.commit()
+            return True
+
+    async def delete_list_item(self, user_id: int, item_id: int) -> bool:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute('SELECT list_id FROM list_items WHERE item_id = ?', (item_id,))
+            row = await cur.fetchone()
+            if not row:
+                return False
+            list_id = row[0]
+            cur2 = await db.execute('SELECT user_id FROM lists WHERE list_id = ?', (list_id,))
+            owner = await cur2.fetchone()
+            if not owner or owner[0] != user_id:
+                return False
+            curd = await db.execute('DELETE FROM list_items WHERE item_id = ?', (item_id,))
+            await db.commit()
+            return curd.rowcount > 0
+
+    async def duplicate_list_to_user(self, src_list_id: int, src_owner_id: int, dest_user_id: int, new_title: Optional[str] = None) -> Tuple[Optional[int], Optional[str]]:
+        # Проверяем, что источник доступен: либо шаблон, либо принадлежит src_owner_id
+        async with aiosqlite.connect(self.db_path) as con:
+            cur = await con.execute('SELECT title, is_template, user_id FROM lists WHERE list_id = ?', (src_list_id,))
+            src = await cur.fetchone()
+            if not src:
+                return None, "Источник не найден"
+            title, is_tmpl, owner_id = src[0], bool(src[1]), src[2]
+            if not is_tmpl and owner_id != src_owner_id:
+                return None, "Нет доступа"
+            new_t = new_title or title
+            cur2 = await con.execute('INSERT INTO lists (user_id, title, is_template) VALUES (?, ?, FALSE)', (dest_user_id, new_t))
+            new_list_id = cur2.lastrowid
+            # Скопируем элементы
+            items_cur = await con.execute('SELECT text, completed FROM list_items WHERE list_id = ? ORDER BY created_at ASC', (src_list_id,))
+            items = await items_cur.fetchall()
+            for text, completed in items:
+                await con.execute('INSERT INTO list_items (list_id, text, completed) VALUES (?, ?, ?)', (new_list_id, text, int(bool(completed))))
+            await con.commit()
+            logger.info(f"📋 Список {src_list_id} скопирован пользователю {dest_user_id} как {new_list_id}")
+            return new_list_id, None
 
 
 # Создаем глобальный экземпляр базы данных

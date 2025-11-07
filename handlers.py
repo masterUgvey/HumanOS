@@ -53,9 +53,16 @@ class QuestProgress(StatesGroup):
 class AIQuest(StatesGroup):
     waiting_for_goal = State()
 
+# ===== Lists FSM =====
+class ListCreation(StatesGroup):
+    waiting_for_title = State()
+
+class ListItemAdd(StatesGroup):
+    waiting_for_text = State()
+
 def get_quests_menu_keyboard() -> ReplyKeyboardMarkup:
     keyboard = [
-        [KeyboardButton(text="📋 Квесты"), KeyboardButton(text="📊 Статистика")],
+        [KeyboardButton(text="📋 Квесты"), KeyboardButton(text="📝 Списки")],
         [KeyboardButton(text="❓ Помощь"), KeyboardButton(text="➕ Создать квест")],
         [KeyboardButton(text="установить часовой пояс")],
     ]
@@ -528,7 +535,10 @@ async def process_edit_comment(message: Message, state: FSMContext):
 @router.callback_query(F.data == "back_to_menu")
 async def cb_back_to_menu(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    await callback.message.edit_text("Главное меню\n\nВыбери действие:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📋 Квесты", callback_data="my_quests_inline")]]))
+    await callback.message.edit_text(
+        "Главное меню\n\nВыбери действие:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📋 Квесты", callback_data="my_quests_inline")], [InlineKeyboardButton(text="📝 Списки", callback_data="lists_menu")]])
+    )
     await callback.answer()
 
 @router.callback_query(F.data == "main_menu")
@@ -536,7 +546,7 @@ async def cb_main_menu(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_text(
         "Главное меню\n\nВыбери действие:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📋 Квесты", callback_data="my_quests_inline")]])
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📋 Квесты", callback_data="my_quests_inline")], [InlineKeyboardButton(text="📝 Списки", callback_data="lists_menu")]])
     )
     await callback.answer()
 
@@ -654,7 +664,7 @@ async def callback_cancel(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text(
         "Главное меню\n\nВыбери действие:",
         reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="📋 Квесты", callback_data="my_quests_inline")]]
+            inline_keyboard=[[InlineKeyboardButton(text="📋 Квесты", callback_data="my_quests_inline")], [InlineKeyboardButton(text="📝 Списки", callback_data="lists_menu")]]
         )
     )
 
@@ -710,6 +720,244 @@ async def callback_meditate(callback: CallbackQuery):
     except Exception:
         pass
 
+# ===================== Lists / Checklists =====================
+def format_list_text(list_row: tuple, items: list[tuple]) -> str:
+    # list_row: (list_id, user_id, title, created_at, is_template)
+    list_id, _, title, created_at, is_template = list_row
+    text = f"📝 <b>{title}</b>\nID: {list_id}\n\n"
+    if is_template:
+        text += "Тип: шаблон\n\n"
+    if not items:
+        text += "Список пуст.\n"
+    else:
+        for item in items:
+            # item: (item_id, list_id, text, completed, created_at)
+            chk = "☑️" if bool(item[3]) else "⬜"
+            text += f"{chk} {item[2]}\n"
+    return text
+
+def build_list_keyboard(list_id: int, items: list[tuple], owner_view: bool = True) -> InlineKeyboardMarkup:
+    rows = []
+    # For each item: toggle + delete
+    for item_id, _, text, completed, _ in items:
+        chk = "☑️" if bool(completed) else "⬜"
+        if owner_view:
+            rows.append([
+                InlineKeyboardButton(text=f"{chk}", callback_data=f"toggle_item_{item_id}_{list_id}"),
+                InlineKeyboardButton(text="🗑", callback_data=f"del_item_{item_id}_{list_id}"),
+                InlineKeyboardButton(text=text[:24] + ("…" if len(text) > 24 else ""), callback_data=f"noop_{item_id}")
+            ])
+        else:
+            rows.append([InlineKeyboardButton(text=f"{chk} {text}", callback_data=f"noop_{item_id}")])
+    # Actions
+    if owner_view:
+        rows.append([InlineKeyboardButton(text="➕ Добавить", callback_data=f"add_item_{list_id}")])
+        rows.append([InlineKeyboardButton(text="🗑 Удалить список", callback_data=f"delete_list_{list_id}")])
+    rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data="lists_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+@router.callback_query(F.data == "lists_menu")
+async def cb_lists_menu(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📂 Мои списки", callback_data="my_lists")],
+        [InlineKeyboardButton(text="🆕 Создать список", callback_data="create_list_inline")],
+        [InlineKeyboardButton(text="📑 Шаблоны", callback_data="list_templates")],
+        [InlineKeyboardButton(text="🔙 Главное меню", callback_data="main_menu")],
+    ])
+    await callback.message.edit_text("📝 Списки — выбери действие:", reply_markup=kb)
+    await callback.answer()
+
+@router.callback_query(F.data == "my_lists")
+async def cb_my_lists(callback: CallbackQuery):
+    lists = await db.get_user_lists(callback.from_user.id)
+    if not lists:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🆕 Создать список", callback_data="create_list_inline")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="lists_menu")],
+        ])
+        await callback.message.edit_text("У тебя пока нет списков.", reply_markup=kb)
+        await callback.answer()
+        return
+    rows = []
+    for l in lists:
+        lid, _, title, _, _ = l
+        rows.append([InlineKeyboardButton(text=f"📝 {title}", callback_data=f"list_{lid}")])
+    rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data="lists_menu")])
+    await callback.message.edit_text("📂 Мои списки:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await callback.answer()
+
+@router.callback_query(F.data == "list_templates")
+async def cb_list_templates(callback: CallbackQuery):
+    templates = await db.get_templates()
+    if not templates:
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="lists_menu")]])
+        await callback.message.edit_text("Шаблоны отсутствуют.", reply_markup=kb)
+        await callback.answer()
+        return
+    rows = []
+    for l in templates:
+        lid, _, title, _, _ = l
+        rows.append([InlineKeyboardButton(text=f"📑 {title}", callback_data=f"list_{lid}")])
+    rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data="lists_menu")])
+    await callback.message.edit_text("📑 Шаблоны:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await callback.answer()
+
+@router.callback_query(F.data == "create_list_inline")
+async def cb_create_list_inline(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(ListCreation.waiting_for_title)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="lists_menu")]])
+    await callback.message.edit_text("Введи название списка:", reply_markup=kb)
+    await callback.answer()
+
+@router.message(ListCreation.waiting_for_title)
+async def process_list_title(message: Message, state: FSMContext):
+    title = (message.text or "").strip()
+    list_id, error = await db.create_list(message.from_user.id, title)
+    await state.clear()
+    if error:
+        await message.answer(f"❌ {error}", reply_markup=get_quests_menu_keyboard())
+        return
+    # Открываем карточку списка
+    lst = await db.get_list(message.from_user.id, list_id)
+    items = await db.get_list_items(message.from_user.id, list_id)
+    text = format_list_text(lst, items)
+    kb = build_list_keyboard(list_id, items, owner_view=True)
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+@router.callback_query(F.data.startswith("list_"))
+async def cb_open_list(callback: CallbackQuery):
+    try:
+        list_id = int(callback.data.split("_")[1])
+    except Exception:
+        await callback.answer("Ошибка ID")
+        return
+    lst = await db.get_list(callback.from_user.id, list_id)
+    if not lst:
+        await callback.answer("Список не найден")
+        return
+    items = await db.get_list_items(callback.from_user.id, list_id)
+    text = format_list_text(lst, items)
+    owner_view = (lst[1] == callback.from_user.id)
+    kb = build_list_keyboard(list_id, items, owner_view=owner_view)
+    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("add_item_"))
+async def cb_add_item(callback: CallbackQuery, state: FSMContext):
+    try:
+        list_id = int(callback.data.split("_")[2])
+    except Exception:
+        await callback.answer("Ошибка ID")
+        return
+    # Проверим доступ
+    lst = await db.get_list(callback.from_user.id, list_id)
+    if not lst or lst[1] != callback.from_user.id:
+        await callback.answer("Нет доступа")
+        return
+    await state.set_state(ListItemAdd.waiting_for_text)
+    await state.update_data(list_id=list_id, orig_chat_id=callback.message.chat.id, orig_message_id=callback.message.message_id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data=f"list_{list_id}")]])
+    await callback.message.answer("Введи текст элемента:", reply_markup=kb)
+    await callback.answer()
+
+@router.message(ListItemAdd.waiting_for_text)
+async def process_add_item(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    data = await state.get_data()
+    list_id = data.get("list_id")
+    item_id, error = await db.add_list_item(message.from_user.id, list_id, text)
+    # Обновляем карточку
+    lst = await db.get_list(message.from_user.id, list_id)
+    items = await db.get_list_items(message.from_user.id, list_id)
+    txt = format_list_text(lst, items)
+    kb = build_list_keyboard(list_id, items, owner_view=True)
+    try:
+        await message.bot.edit_message_text(
+            chat_id=data.get("orig_chat_id"),
+            message_id=data.get("orig_message_id"),
+            text=txt,
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+    await state.clear()
+    if error:
+        await message.answer(f"❌ {error}")
+    else:
+        await message.answer("✅ Элемент добавлен", reply_markup=get_quests_menu_keyboard())
+
+@router.callback_query(F.data.startswith("toggle_item_"))
+async def cb_toggle_item(callback: CallbackQuery):
+    try:
+        _, _, item_id_str, list_id_str = callback.data.split("_", 3)
+        item_id = int(item_id_str)
+        list_id = int(list_id_str)
+    except Exception:
+        await callback.answer("Ошибка ID")
+        return
+    ok = await db.toggle_list_item(callback.from_user.id, item_id)
+    if not ok:
+        await callback.answer("Ошибка")
+        return
+    # Перерисуем
+    lst = await db.get_list(callback.from_user.id, list_id)
+    items = await db.get_list_items(callback.from_user.id, list_id)
+    text = format_list_text(lst, items)
+    kb = build_list_keyboard(list_id, items, owner_view=(lst and lst[1] == callback.from_user.id))
+    try:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        pass
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("del_item_"))
+async def cb_del_item(callback: CallbackQuery):
+    try:
+        _, _, item_id_str, list_id_str = callback.data.split("_", 3)
+        item_id = int(item_id_str)
+        list_id = int(list_id_str)
+    except Exception:
+        await callback.answer("Ошибка ID")
+        return
+    ok = await db.delete_list_item(callback.from_user.id, item_id)
+    if not ok:
+        await callback.answer("Ошибка удаления")
+        return
+    lst = await db.get_list(callback.from_user.id, list_id)
+    items = await db.get_list_items(callback.from_user.id, list_id)
+    text = format_list_text(lst, items)
+    kb = build_list_keyboard(list_id, items, owner_view=(lst and lst[1] == callback.from_user.id))
+    try:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        pass
+    await callback.answer("🗑 Удалено")
+
+@router.callback_query(F.data.startswith("delete_list_"))
+async def cb_delete_list(callback: CallbackQuery):
+    try:
+        list_id = int(callback.data.split("_")[2])
+    except Exception:
+        await callback.answer("Ошибка ID")
+        return
+    ok = await db.delete_list(callback.from_user.id, list_id)
+    if not ok:
+        await callback.answer("Ошибка удаления")
+        return
+    # Показать мои списки
+    await cb_my_lists(callback)
+
+@router.callback_query(F.data.startswith("share_list_"))
+async def cb_share_list(callback: CallbackQuery):
+    await callback.answer("Функция временно недоступна")
+    return
+
+@router.callback_query(F.data.startswith("copy_list_"))
+async def cb_copy_list(callback: CallbackQuery):
+    await callback.answer("Функция временно недоступна")
+    return
 @router.callback_query(F.data.startswith("cancel_meditation_"))
 async def cancel_meditation(callback: CallbackQuery):
     try:
@@ -810,6 +1058,21 @@ async def show_my_quests(message: Message, state: FSMContext):
         type_emoji = {"physical": "💪", "intellectual": "📚", "mental": "🧠", "custom": "🎯"}.get(q_type, "🎯")
         keyboard.append([InlineKeyboardButton(text=f"{status_emoji} {type_emoji} {title}", callback_data=f"quest_{q_id}")])
     await message.answer("📋 Выбери квест:", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+
+
+@router.message((F.text == "📝 Списки") | (F.text.casefold() == "списки"))
+async def open_lists_menu(message: Message, state: FSMContext):
+    try:
+        await state.clear()
+    except Exception:
+        pass
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📂 Мои списки", callback_data="my_lists")],
+        [InlineKeyboardButton(text="🆕 Создать список", callback_data="create_list_inline")],
+        [InlineKeyboardButton(text="📑 Шаблоны", callback_data="list_templates")],
+        [InlineKeyboardButton(text="🔙 Главное меню", callback_data="main_menu")],
+    ])
+    await message.answer("📝 Списки — выбери действие:", reply_markup=kb)
 
 
 @router.message(F.text == "➕ Создать квест")
