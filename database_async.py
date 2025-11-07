@@ -267,6 +267,13 @@ class Database:
             cursor = await db.execute('SELECT user_id FROM users WHERE COALESCE(log_subscribed, FALSE) = TRUE')
             rows = await cursor.fetchall()
             return [r[0] for r in rows]
+
+    async def get_all_user_ids(self) -> List[int]:
+        """Получить user_id всех пользователей"""
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute('SELECT user_id FROM users')
+            rows = await cur.fetchall()
+            return [r[0] for r in rows]
     
     async def create_quest(
         self,
@@ -386,6 +393,16 @@ class Database:
             )
             quests = await cursor.fetchall()
             return quests
+
+    async def get_user_regular_quests(self, user_id: int) -> List[tuple]:
+        """Активные НЕ ежедневные квесты"""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                'SELECT quest_id, user_id, title, quest_type, target_value, current_value, completed, deadline, comment, created_at, has_date, has_time '
+                'FROM quests WHERE user_id = ? AND completed = FALSE AND COALESCE(is_daily, FALSE) = FALSE ORDER BY created_at DESC',
+                (user_id,)
+            )
+            return await cursor.fetchall()
 
     async def sanitize_existing_data(self) -> None:
         """Привести БД в порядок:
@@ -580,7 +597,13 @@ class Database:
         deadline: Optional[str] = None,
         comment: Optional[str] = None,
         has_date: Optional[bool] = None,
-        has_time: Optional[bool] = None
+        has_time: Optional[bool] = None,
+        # Daily extensions
+        is_daily: Optional[bool] = None,
+        repeat_days: Optional[str] = None,
+        daily_reminder_time: Optional[str] = None,
+        last_done_date: Optional[str] = None,
+        streak: Optional[int] = None,
     ) -> Tuple[Optional[tuple], Optional[str]]:
         """
         Обновление параметров квеста с валидацией
@@ -670,6 +693,24 @@ class Database:
         if has_time is not None:
             updates.append('has_time = ?')
             params.append(int(bool(has_time)))
+        # Daily fields
+        if is_daily is not None:
+            updates.append('is_daily = ?')
+            params.append(int(bool(is_daily)))
+        if repeat_days is not None:
+            # empty string allowed means every day by convention
+            updates.append('repeat_days = ?')
+            params.append(repeat_days)
+        if daily_reminder_time is not None:
+            # allow NULL by passing empty string? Here None skips update, empty string sets empty
+            updates.append('daily_reminder_time = ?')
+            params.append(daily_reminder_time)
+        if last_done_date is not None:
+            updates.append('last_done_date = ?')
+            params.append(last_done_date)
+        if streak is not None:
+            updates.append('streak = ?')
+            params.append(int(streak))
         logger.info(f"[DB] update_quest -> quest_id={quest_id}, user_id={user_id}, updates={updates}, params={params}")
         
         if not updates:
@@ -802,6 +843,17 @@ class Database:
             await con.execute('UPDATE quests SET last_done_date = NULL, streak = ? WHERE quest_id = ? AND user_id = ?', (new_streak, quest_id, user_id))
             await con.commit()
             return True
+
+    async def is_quest_daily(self, quest_id: int) -> bool:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute('SELECT COALESCE(is_daily, FALSE) FROM quests WHERE quest_id = ?', (quest_id,))
+            row = await cur.fetchone()
+            return bool(row and row[0])
+
+    async def get_daily_meta(self, quest_id: int) -> Optional[tuple]:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute('SELECT repeat_days, streak, last_done_date, daily_reminder_time, user_id FROM quests WHERE quest_id = ?', (quest_id,))
+            return await cur.fetchone()
 
     # ===== Lists API =====
     async def create_list(self, user_id: int, title: str, is_template: bool = False) -> Tuple[Optional[int], Optional[str]]:

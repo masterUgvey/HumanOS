@@ -30,6 +30,7 @@ MEDITATION_SESSIONS = {}
 
 # FSM States для управления состояниями диалога
 class QuestCreation(StatesGroup):
+    waiting_for_mode = State()
     waiting_for_type = State()
     waiting_for_title = State()
     waiting_for_reps = State()
@@ -40,6 +41,10 @@ class QuestCreation(StatesGroup):
     waiting_for_deadline_input = State()
     waiting_for_deadline_time = State()
     waiting_for_comment = State()
+    # Daily-specific
+    waiting_for_daily_days = State()
+    waiting_for_daily_time = State()
+    waiting_for_daily_time_custom = State()
 
 class QuestEdit(StatesGroup):
     waiting_for_title = State()
@@ -97,6 +102,48 @@ def compute_status_emoji(deadline_str: str | None) -> str:
     except Exception:
         return "⚪"
 
+def format_repeat_days_label(repeat_days: str | None) -> str:
+    if not repeat_days or repeat_days.strip() == "":
+        return "Каждый день"
+    names = {1: "Пн", 2: "Вт", 3: "Ср", 4: "Чт", 5: "Пт", 6: "Сб", 7: "Вс"}
+    try:
+        parts = [p.strip() for p in repeat_days.split(',') if p.strip()]
+        nums = []
+        for p in parts:
+            v = int(p)
+            if v == 0: v = 7
+            nums.append(v)
+        return ",".join(names.get(n, str(n)) for n in nums)
+    except Exception:
+        return repeat_days or "Каждый день"
+
+def build_daily_days_keyboard(selected: list[int]) -> InlineKeyboardMarkup:
+    names = {1: "Пн", 2: "Вт", 3: "Ср", 4: "Чт", 5: "Пт", 6: "Сб", 7: "Вс"}
+    rows = []
+    row = []
+    for i in range(1, 8):
+        label = ("✅ " if i in selected else "⬜ ") + names[i]
+        row.append(InlineKeyboardButton(text=label, callback_data=f"daily_days_toggle_{i}"))
+        if i % 4 == 0:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([
+        InlineKeyboardButton(text="📅 Каждый день", callback_data="daily_days_preset_all"),
+        InlineKeyboardButton(text="🏢 Будни", callback_data="daily_days_preset_weekdays"),
+        InlineKeyboardButton(text="🌅 Выходные", callback_data="daily_days_preset_weekend"),
+    ])
+    rows.append([InlineKeyboardButton(text="Далее ➡️", callback_data="daily_days_next")])
+    rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data="create_quest_inline")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+async def start_daily_days_selection(message: Message, state: FSMContext):
+    await state.set_state(QuestCreation.waiting_for_daily_days)
+    await state.update_data(daily_days=[])  # empty -> каждый день по умолчанию допускаем, но пользователь сможет выбрать
+    kb = build_daily_days_keyboard([])
+    await message.answer("Выберите дни повторения:", reply_markup=kb)
+
 def get_quest_detail_keyboard(quest_id: int, completed: bool, quest_type: str, target_value: int) -> InlineKeyboardMarkup:
     keyboard = []
     # Скрываем обновление прогресса для custom без шкалы и для медитации
@@ -108,6 +155,17 @@ def get_quest_detail_keyboard(quest_id: int, completed: bool, quest_type: str, t
     keyboard.append([InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete_{quest_id}")])
     if quest_type == "mental":
         keyboard.append([InlineKeyboardButton(text="▶️ Начать медитацию", callback_data=f"meditate_{quest_id}")])
+    keyboard.append([InlineKeyboardButton(text="🔙 К списку", callback_data="my_quests_inline")])
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+def get_daily_detail_keyboard(quest_id: int, done_today: bool) -> InlineKeyboardMarkup:
+    keyboard = []
+    if not done_today:
+        keyboard.append([InlineKeyboardButton(text="✅ Выполнить сегодня", callback_data=f"daily_done_{quest_id}")])
+    else:
+        keyboard.append([InlineKeyboardButton(text="↩️ Отменить выполнение", callback_data=f"daily_undo_{quest_id}")])
+    keyboard.append([InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"edit_{quest_id}")])
+    keyboard.append([InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete_{quest_id}")])
     keyboard.append([InlineKeyboardButton(text="🔙 К списку", callback_data="my_quests_inline")])
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
@@ -128,8 +186,172 @@ async def cb_quest_detail(callback: CallbackQuery):
     completed = bool(quest[6])
     quest_type = quest[3]
     target_value = int(quest[4])
+    # Daily rendering
+    if await db.is_quest_daily(quest_id):
+        meta = await db.get_daily_meta(quest_id)
+        if meta:
+            repeat_days, streak, last_done_date, daily_reminder_time, owner_uid = meta
+            done_today = await db.is_done_today(callback.from_user.id, quest_id)
+            days_label = format_repeat_days_label(repeat_days)
+            today_status = "✅ Выполнено сегодня" if done_today else "⏳ На сегодня"
+            rt = daily_reminder_time or "нет"
+            text += f"\n📅 Режим: Ежедневная задача\n📆 Дни: {days_label}\n🔥 Серия: {int(streak or 0)} дней\n⏰ Напоминание: {rt}\n📊 Сегодня: {today_status}\n"
+            await callback.message.edit_text(text, reply_markup=get_daily_detail_keyboard(quest_id, done_today), parse_mode="HTML")
+            await callback.answer()
+            return
     await callback.message.edit_text(text, reply_markup=get_quest_detail_keyboard(quest_id, completed, quest_type, target_value), parse_mode="HTML")
     await callback.answer()
+
+# ===== Daily: days selection =====
+@router.callback_query(F.data.startswith("daily_days_toggle_"))
+async def cb_daily_days_toggle(callback: CallbackQuery, state: FSMContext):
+    try:
+        day = int(callback.data.split("_")[-1])
+    except Exception:
+        await callback.answer("Ошибка")
+        return
+    data = await state.get_data()
+    sel = set(data.get("daily_days") or [])
+    if day in sel:
+        sel.remove(day)
+    else:
+        sel.add(day)
+    await state.update_data(daily_days=sorted(sel))
+    kb = build_daily_days_keyboard(sorted(sel))
+    try:
+        await callback.message.edit_reply_markup(reply_markup=kb)
+    except Exception:
+        try:
+            await callback.message.edit_text("Выберите дни повторения:", reply_markup=kb)
+        except Exception:
+            pass
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("daily_days_preset_"))
+async def cb_daily_days_preset(callback: CallbackQuery, state: FSMContext):
+    preset = callback.data.split("_")[-1]
+    if preset == "all":
+        sel = [1,2,3,4,5,6,7]
+    elif preset == "weekdays":
+        sel = [1,2,3,4,5]
+    else:
+        sel = [6,7]
+    await state.update_data(daily_days=sel)
+    kb = build_daily_days_keyboard(sel)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=kb)
+    except Exception:
+        try:
+            await callback.message.edit_text("Выберите дни повторения:", reply_markup=kb)
+        except Exception:
+            pass
+    await callback.answer()
+
+@router.callback_query(F.data == "daily_days_next")
+async def cb_daily_days_next(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(QuestCreation.waiting_for_daily_time)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="09:00", callback_data="daily_time_09:00"), InlineKeyboardButton(text="12:00", callback_data="daily_time_12:00"), InlineKeyboardButton(text="18:00", callback_data="daily_time_18:00")],
+        [InlineKeyboardButton(text="Без напоминания", callback_data="daily_time_none")],
+        [InlineKeyboardButton(text="Ввести своё", callback_data="daily_time_custom")],
+    ])
+    await callback.message.edit_text("Во сколько напоминать?", reply_markup=kb)
+    await callback.answer()
+
+# ===== Daily: time selection =====
+@router.callback_query(F.data.startswith("daily_time_"))
+async def cb_daily_time(callback: CallbackQuery, state: FSMContext):
+    tag = callback.data.split("_", 2)[-1]
+    if tag == "custom":
+        await state.set_state(QuestCreation.waiting_for_daily_time_custom)
+        await callback.message.edit_text("Введите время в формате HH:MM (например, 09:00) или отправьте 'нет' для отключения напоминаний")
+        await callback.answer()
+        return
+    reminder = None if tag == "none" else tag
+    await finalize_daily_creation(callback, state, reminder)
+
+@router.message(QuestCreation.waiting_for_daily_time_custom)
+async def process_daily_time_custom(message: Message, state: FSMContext):
+    t = (message.text or "").strip().lower()
+    if t in {"нет", "no", "none"}:
+        reminder = None
+    else:
+        try:
+            hh, mm = map(int, t.split(":"))
+            if not (0 <= hh <= 23 and 0 <= mm <= 59):
+                raise ValueError
+            reminder = f"{hh:02d}:{mm:02d}"
+        except Exception:
+            await message.answer("Некорректное время. Формат HH:MM")
+            return
+    await finalize_daily_creation(message, state, reminder)
+
+async def finalize_daily_creation(event, state: FSMContext, reminder: str | None):
+    # event can be Message or CallbackQuery
+    get_uid = (lambda: event.from_user.id)
+    send_answer = (lambda text, **kw: (event.message.answer if hasattr(event, 'message') else event.answer)(text, **kw))
+    send_card = (lambda text, **kw: (event.message.answer if hasattr(event, 'message') else event.message.answer)(text, **kw))
+    data = await state.get_data()
+    user_id = get_uid()
+    # Normalize days
+    days = data.get("daily_days") or []
+    # Empty -> каждый день
+    repeat_days = ",".join(str(d) for d in days)
+    # Create base quest
+    quest_id, error = await db.create_quest(
+        user_id=user_id,
+        title=data.get("title"),
+        quest_type=data.get("quest_type"),
+        target_value=int(data.get("target_value") or 0),
+        deadline=None,
+        comment=None,
+        has_date=False,
+        has_time=False,
+    )
+    if error or not quest_id:
+        await state.clear()
+        await send_answer(f"❌ Ошибка: {error or 'не удалось создать задание'}")
+        return
+    # Update daily fields
+    await db.update_quest(user_id, quest_id, is_daily=True, repeat_days=repeat_days, daily_reminder_time=reminder)
+    await state.clear()
+    # Show daily card
+    quest = await db.get_quest(user_id, quest_id)
+    tz_off, _ = await db.get_user_timezone(user_id)
+    text = format_quest_text(quest, tz_off)
+    meta = await db.get_daily_meta(quest_id)
+    repeat_days_s, streak, last_done_date, daily_reminder_time, _ = meta if meta else ("", 0, None, None, None)
+    done_today = await db.is_done_today(user_id, quest_id)
+    text += f"\n📅 Режим: Ежедневная задача\n📆 Дни: {format_repeat_days_label(repeat_days_s)}\n🔥 Серия: {int(streak or 0)} дней\n⏰ Напоминание: {daily_reminder_time or 'нет'}\n📊 Сегодня: {'✅ Выполнено сегодня' if done_today else '⏳ На сегодня'}\n"
+    kb = get_daily_detail_keyboard(quest_id, done_today)
+    await send_card(text, reply_markup=kb, parse_mode="HTML")
+
+# ===== Daily actions =====
+@router.callback_query(F.data.startswith("daily_done_"))
+async def cb_daily_done(callback: CallbackQuery):
+    try:
+        quest_id = int(callback.data.split("_")[2])
+    except Exception:
+        await callback.answer("Ошибка ID")
+        return
+    ok = await db.mark_daily_done_for_today(callback.from_user.id, quest_id)
+    if not ok:
+        await callback.answer("Ошибка")
+        return
+    await cb_quest_detail(callback)
+
+@router.callback_query(F.data.startswith("daily_undo_"))
+async def cb_daily_undo(callback: CallbackQuery):
+    try:
+        quest_id = int(callback.data.split("_")[2])
+    except Exception:
+        await callback.answer("Ошибка ID")
+        return
+    ok = await db.undo_daily_for_today(callback.from_user.id, quest_id)
+    if not ok:
+        await callback.answer("Ошибка")
+        return
+    await cb_quest_detail(callback)
 
 def format_quest_text(quest: tuple, tz_offset_minutes: int | None = None) -> str:
     """Форматирование текста квеста с учетом наличия даты/времени"""
@@ -552,8 +774,27 @@ async def cb_main_menu(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "create_quest_inline")
 async def cb_create_quest_inline(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(QuestCreation.waiting_for_mode)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎯 Обычный квест", callback_data="mode_regular")],
+        [InlineKeyboardButton(text="📅 Ежедневная задача", callback_data="mode_daily")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")],
+    ])
+    await callback.message.answer("Выберите режим:", reply_markup=kb)
+    await callback.answer()
+
+@router.callback_query(F.data == "mode_regular")
+async def cb_mode_regular(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(is_daily=False)
     await state.set_state(QuestCreation.waiting_for_type)
     await callback.message.answer("Выбери тип квеста:", reply_markup=get_quest_type_keyboard())
+    await callback.answer()
+
+@router.callback_query(F.data == "mode_daily")
+async def cb_mode_daily(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(is_daily=True)
+    await state.set_state(QuestCreation.waiting_for_type)
+    await callback.message.answer("Выбери тип ежедневной задачи:", reply_markup=get_quest_type_keyboard())
     await callback.answer()
 
 
@@ -1087,8 +1328,13 @@ async def create_quest_menu(message: Message, state: FSMContext):
         await state.update_data(_pending_creation_after_tz=True)
         await message.answer("Для точного дедлайна укажи свой часовой пояс. Сделать сейчас?", reply_markup=kb)
         return
-    await state.set_state(QuestCreation.waiting_for_type)
-    await message.answer("Выбери тип квеста:", reply_markup=get_quest_type_keyboard())
+    await state.set_state(QuestCreation.waiting_for_mode)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎯 Обычный квест", callback_data="mode_regular")],
+        [InlineKeyboardButton(text="📅 Ежедневная задача", callback_data="mode_daily")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")],
+    ])
+    await message.answer("Выберите режим:", reply_markup=kb)
 
 
 class TimezoneSetup(StatesGroup):
@@ -1111,8 +1357,13 @@ async def cb_tz_setup_skip(callback: CallbackQuery, state: FSMContext):
     pending = (await state.get_data()).get("_pending_creation_after_tz")
     await callback.answer("Ок, используем время по умолчанию")
     if pending:
-        await state.set_state(QuestCreation.waiting_for_type)
-        await callback.message.answer("Выбери тип квеста:", reply_markup=get_quest_type_keyboard())
+        await state.set_state(QuestCreation.waiting_for_mode)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎯 Обычный квест", callback_data="mode_regular")],
+            [InlineKeyboardButton(text="📅 Ежедневная задача", callback_data="mode_daily")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")],
+        ])
+        await callback.message.answer("Выберите режим:", reply_markup=kb)
     else:
         await callback.message.answer("Часовой пояс можно установить в главном меню")
 
@@ -1139,28 +1390,44 @@ async def process_local_time(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("Часовой пояс сохранён", reply_markup=get_quests_menu_keyboard())
     if pending:
-        await state.set_state(QuestCreation.waiting_for_type)
-        await message.answer("Выбери тип квеста:", reply_markup=get_quest_type_keyboard())
+        await state.set_state(QuestCreation.waiting_for_mode)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎯 Обычный квест", callback_data="mode_regular")],
+            [InlineKeyboardButton(text="📅 Ежедневная задача", callback_data="mode_daily")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")],
+        ])
+        await message.answer("Выберите режим:", reply_markup=kb)
 
 
 @router.callback_query(F.data == "my_quests_inline")
 async def cb_my_quests(callback: CallbackQuery):
     user_id = callback.from_user.id
-    quests = await db.get_user_quests(user_id)
-    if not quests:
+    dailies = await db.get_user_daily_quests(user_id)
+    regular = await db.get_user_regular_quests(user_id)
+    if not dailies and not regular:
         keyboard = [[InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_menu")]]
         await callback.message.edit_text("📋 У тебя пока нет активных квестов!", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
         await callback.answer()
         return
-    keyboard = []
-    for quest in quests:
-        quest_id = quest[0]
-        title = quest[2]
-        quest_type = quest[3]
-        status_emoji = compute_status_emoji(quest[7])
-        type_emoji = {"physical": "💪", "intellectual": "📚", "mental": "🧠", "custom": "🎯"}.get(quest_type, "🎯")
-        keyboard.append([InlineKeyboardButton(text=f"{status_emoji} {type_emoji} {title}", callback_data=f"quest_{quest_id}")])
-    await callback.message.edit_text("📋 Выбери квест:", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+    rows = []
+    if dailies:
+        rows.append([InlineKeyboardButton(text="📅 Ежедневные задачи", callback_data="noop")])
+        for q in dailies:
+            qid, _, title, qtype = q[0], q[1], q[2], q[3]
+            status = "✅" if await db.is_done_today(user_id, qid) else "⏳"
+            rows.append([InlineKeyboardButton(text=f"{status} {title}", callback_data=f"quest_{qid}")])
+    if regular:
+        if dailies:
+            rows.append([InlineKeyboardButton(text="────────", callback_data="noop")])
+        rows.append([InlineKeyboardButton(text="🎯 Обычные квесты", callback_data="noop")])
+        for quest in regular:
+            quest_id = quest[0]
+            title = quest[2]
+            quest_type = quest[3]
+            status_emoji = compute_status_emoji(quest[7])
+            type_emoji = {"physical": "💪", "intellectual": "📚", "mental": "🧠", "custom": "🎯"}.get(quest_type, "🎯")
+            rows.append([InlineKeyboardButton(text=f"{status_emoji} {type_emoji} {title}", callback_data=f"quest_{quest_id}")])
+    await callback.message.edit_text("📋 Выбери квест:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await callback.answer()
 
 
@@ -1177,6 +1444,7 @@ async def select_quest_type(message: Message, state: FSMContext):
         await message.answer("Пожалуйста, выбери тип из кнопок ниже")
         return
     await state.update_data(quest_type=quest_type)
+    # Для daily продолжаем тем же сценарием, но далее ветвимся на выбор дней/времени
     if quest_type == "mental":
         await state.update_data(title="Медитация")
         await state.set_state(QuestCreation.waiting_for_minutes)
@@ -1272,12 +1540,16 @@ async def process_sets(message: Message, state: FSMContext):
             await message.answer("✅ Цель обновлена", reply_markup=get_quests_menu_keyboard())
         return
     # Иначе — сценарий создания
-    await state.set_state(QuestCreation.waiting_for_deadline_input)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="сегодня", callback_data="deadline_today")],
-        [InlineKeyboardButton(text="пропустить", callback_data="deadline_skip_all")],
-    ])
-    await message.answer("Укажи дедлайн в формате dd.mm.yy hh:mm или выбери кнопку ниже", reply_markup=kb)
+    data = await state.get_data()
+    if data.get("is_daily"):
+        await start_daily_days_selection(message, state)
+    else:
+        await state.set_state(QuestCreation.waiting_for_deadline_input)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="сегодня", callback_data="deadline_today")],
+            [InlineKeyboardButton(text="пропустить", callback_data="deadline_skip_all")],
+        ])
+        await message.answer("Укажи дедлайн в формате dd.mm.yy hh:mm или выбери кнопку ниже", reply_markup=kb)
 
 
 @router.message(QuestCreation.waiting_for_pages)

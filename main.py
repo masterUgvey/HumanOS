@@ -19,11 +19,13 @@ LOG_QUEUE: asyncio.Queue | None = None
 
 # Состояние напоминаний в памяти: {quest_id: {"h1": bool, "overdue": bool}}
 REMINDER_STATE = {}
+# Ежедневные напоминания: {(quest_id, date_str, hhmm): True}
+DAILY_REMINDER_STATE = {}
 
 
 async def reminder_loop(bot: Bot):
     """Фоновая задача: рассылает напоминания за час до дедлайна и по просрочке"""
-    global REMINDER_STATE
+    global REMINDER_STATE, DAILY_REMINDER_STATE
     while True:
         try:
             quests = await db.get_quests_with_deadlines()
@@ -75,6 +77,63 @@ async def reminder_loop(bot: Bot):
                         state["overdue"] = True
                     except Exception:
                         pass
+            # Daily reminders
+            try:
+                # Получим всех пользователей и проверим локальное время каждого
+                user_ids = await db.get_all_user_ids()
+                for uid in user_ids:
+                    tz_off, _ = await db.get_user_timezone(uid)
+                    dt_local = now_utc + timedelta(minutes=int(tz_off or 0))
+                    hhmm = dt_local.strftime("%H:%M")
+                    today_str = dt_local.strftime("%Y-%m-%d")
+                    # 1..7, где Пн=1
+                    weekday = int(dt_local.isoweekday())
+                    dailies = await db.get_user_daily_quests(uid)
+                    if not dailies:
+                        continue
+                    for dq in dailies:
+                        qid = dq[0]
+                        title = dq[2]
+                        daily_rt = (dq[16] if len(dq) > 16 else None)  # daily_reminder_time
+                        repeat_days = (dq[13] if len(dq) > 13 else None)
+                        if not daily_rt:
+                            continue
+                        if daily_rt != hhmm:
+                            continue
+                        # Проверка repeat_days: пусто/NULL -> каждый день
+                        ok_day = True
+                        try:
+                            if repeat_days and repeat_days.strip() != "":
+                                days = [int(p.strip()) for p in repeat_days.split(',') if p.strip()]
+                                ok_day = (weekday in days)
+                        except Exception:
+                            ok_day = True
+                        if not ok_day:
+                            continue
+                        # Проверка «ещё не выполнено сегодня»
+                        try:
+                            done_today = await db.is_done_today(uid, qid)
+                        except Exception:
+                            done_today = False
+                        if done_today:
+                            continue
+                        # Дедупликация на один и тот же день и минуту
+                        key = (qid, today_str, hhmm)
+                        if DAILY_REMINDER_STATE.get(key):
+                            continue
+                        try:
+                            from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+                            kb = InlineKeyboardMarkup(inline_keyboard=[
+                                [InlineKeyboardButton(text="🔎 Открыть", callback_data=f"quest_{qid}")],
+                                [InlineKeyboardButton(text="📋 Квесты", callback_data="my_quests_inline")],
+                            ])
+                            await bot.send_message(uid, f"📅 Напоминание: {title}. Не забудьте выполнить ежедневную задачу!", reply_markup=kb)
+                            DAILY_REMINDER_STATE[key] = True
+                        except Exception:
+                            pass
+            except Exception as e:
+                logger.warning(f"Daily reminder error: {e}")
+
             # Пауза между циклами
             await asyncio.sleep(60)
         except asyncio.CancelledError:
